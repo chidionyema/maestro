@@ -56,7 +56,10 @@ class Config:
     GITHUB_REPO = os.getenv("MAESTRO_GITHUB_REPO", "")
     DEFAULT_LOCAL_MODEL = os.getenv("MAESTRO_LOCAL_MODEL", "qwen2.5:7b")
     DEFAULT_API_MODEL = os.getenv("MAESTRO_API_MODEL", "deepseek-chat")
-    ESTATE_AUDIT_PATH = os.getenv("MAESTRO_AUDIT", "~/.estate/audit.json")
+    ESTATE_AUDIT_PATH = os.getenv("MAESTRO_AUDIT", "~/.claude/state/estate-audit.json")
+    # Free space, not percent used. See check_disk for why percent lies on APFS.
+    DISK_FREE_GB_CRITICAL = float(os.getenv("MAESTRO_DISK_CRITICAL_GB", "5"))
+    DISK_FREE_GB_WARNING = float(os.getenv("MAESTRO_DISK_WARNING_GB", "15"))
     INTENT_LOG_DIR = os.getenv("MAESTRO_INTENTS", "~/.maestro/intents")
     SKILLS_DIR = os.getenv("MAESTRO_SKILLS", "~/.maestro/skills")
 
@@ -167,9 +170,26 @@ class ExperienceGraph:
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         self._init_schema()
 
+    def kv_get(self, key: str, default=None):
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else default
+
+    def kv_set(self, key: str, value: str):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO kv (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, str(value)),
+            )
+
     def _init_schema(self):
         with sqlite3.connect(self.db_path) as conn:
             conn.executescript("""
+                CREATE TABLE IF NOT EXISTS kv (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS episodes (
                     id TEXT PRIMARY KEY,
                     timestamp TEXT NOT NULL,
@@ -722,27 +742,35 @@ class EstateSensors:
     def check_disk(self) -> List[Dict]:
         findings = []
         try:
+            # Percent-used is not a usable signal on APFS. statvfs f_bfree and
+            # f_bavail both exclude purgeable space, so this machine reads 95.9%
+            # while `df -h /` reads 40% -- a P0 crisis every 60 seconds on a disk
+            # with 19 GiB free. Free bytes is the same number under both
+            # accountings, so alert on that and report percent for context only.
             stat = os.statvfs("/")
+            free_gb = stat.f_bavail * stat.f_frsize / (1024 ** 3)
             percent = (stat.f_blocks - stat.f_bfree) / stat.f_blocks * 100
-            if percent > 90:
+            if free_gb < Config.DISK_FREE_GB_CRITICAL:
                 findings.append({
                     "id": "disk-critical",
                     "severity": "P0",
                     "lane": "estate",
-                    "description": f"Disk at {percent:.1f}%",
+                    "description": f"Disk has {free_gb:.1f} GiB free ({percent:.1f}% used)",
                     "auto_fix": True,
                     "skill": "disk_cleanup",
-                    "context": {"percent": percent, "threshold": 90}
+                    "context": {"free_gb": free_gb, "percent": percent,
+                                "threshold_gb": Config.DISK_FREE_GB_CRITICAL}
                 })
-            elif percent > 80:
+            elif free_gb < Config.DISK_FREE_GB_WARNING:
                 findings.append({
                     "id": "disk-warning",
                     "severity": "P1",
                     "lane": "estate",
-                    "description": f"Disk at {percent:.1f}%",
+                    "description": f"Disk has {free_gb:.1f} GiB free ({percent:.1f}% used)",
                     "auto_fix": True,
                     "skill": "disk_cleanup",
-                    "context": {"percent": percent, "threshold": 80}
+                    "context": {"free_gb": free_gb, "percent": percent,
+                                "threshold_gb": Config.DISK_FREE_GB_WARNING}
                 })
         except Exception as e:
             logger.error(f"Disk check failed: {e}")
@@ -897,7 +925,14 @@ class Maestro:
         self.state = State.IDLE
         self.current_intent: Optional[Intent] = None
         self.crisis_mode = False
-        self.last_meta_review = datetime.utcnow() - timedelta(hours=25)
+        # Was: utcnow() - 25h. That made every fresh process go IDLE -> META_REVIEW
+        # and stop there, so `--once` could never reach SENSE and the dry test only
+        # ever exercised one branch. The timestamp is durable now: a restart resumes
+        # the real schedule, and a first-ever run senses before it reviews itself.
+        _last = self.db.kv_get("last_meta_review")
+        self.last_meta_review = (
+            datetime.fromisoformat(_last) if _last else datetime.utcnow()
+        )
         self.daily_findings: List[Dict] = []
         self.daily_resolved: List[Dict] = []
         self.daily_needs_human: List[Dict] = []
@@ -1224,6 +1259,7 @@ class Maestro:
             )
 
         self.last_meta_review = datetime.utcnow()
+        self.db.kv_set("last_meta_review", self.last_meta_review.isoformat())
         self._transition(State.IDLE)
 
     def run(self):
@@ -1266,6 +1302,14 @@ if __name__ == "__main__":
     maestro = Maestro()
 
     if args.once:
-        maestro.tick()
+        # One tick is one state transition, so a single call stopped at SENSE and
+        # proved nothing. A dry run drives the machine until it comes back to IDLE.
+        for _ in range(20):
+            maestro.tick()
+            if maestro.state == State.IDLE:
+                break
+        else:
+            logger.warning("Dry run did not return to IDLE within 20 transitions")
+            sys.exit(1)
     else:
         maestro.run()
