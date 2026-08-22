@@ -1,0 +1,1271 @@
+#!/usr/bin/env python3
+"""
+MAESTRO DEPUTY v1.0
+Autonomous Estate Overseer with Recursive Failure Inoculation
+
+Core hypothesis (testable law):
+LAW_OF_ENTROPIC_INVERSION: In a sufficiently instrumented system with causal
+attribution, every failure mode extracted as a shape, encoded as an invariant,
+and verified against simulation, reduces the probability of that shape's recurrence
+in any context by an observable margin that compounds with each iteration.
+
+Falsification conditions:
+- If shape extraction produces false positives >20%
+- If prevention success rate does not improve over 10 incidents
+- If system introduces novel failure modes at rate >baseline human operation
+"""
+
+import os
+import sys
+import json
+import time
+import sqlite3
+import hashlib
+import logging
+import subprocess
+import threading
+from enum import Enum, auto
+from dataclasses import dataclass, field, asdict
+from typing import Optional, Dict, List, Any, Callable, Tuple
+from datetime import datetime, timedelta
+from contextlib import contextmanager
+from pathlib import Path
+
+# ───────────────────────────────────────────────────────────────────────────────
+# CONFIGURATION
+# ───────────────────────────────────────────────────────────────────────────────
+
+class Config:
+    """Centralized, environment-overridable configuration."""
+    DB_PATH = os.getenv("MAESTRO_DB", "~/.maestro/experience_graph.db")
+    TICK_INTERVAL = int(os.getenv("MAESTRO_TICK", "60"))
+    META_REVIEW_INTERVAL_HOURS = int(os.getenv("MAESTRO_META", "24"))
+    CRISIS_TIMEOUT_MINUTES = int(os.getenv("MAESTRO_CRISIS", "120"))
+    MAX_DAILY_SPEND_USD = float(os.getenv("MAESTRO_BUDGET", "50.0"))
+    ALERT_THRESHOLD_USD = float(os.getenv("MAESTRO_ALERT", "10.0"))
+
+    LANES = {
+        "estate": {"auto_fix": True, "escalate_after_attempts": 2, "budget_usd": 5.0},
+        "research": {"auto_fix": False, "escalate_after_attempts": 0, "budget_usd": 20.0},
+        "meta": {"auto_fix": False, "escalate_after_attempts": 0, "budget_usd": 5.0},
+    }
+
+    TELEGRAM_TOKEN = os.getenv("MAESTRO_TELEGRAM_TOKEN", "")
+    TELEGRAM_CHAT_ID = os.getenv("MAESTRO_TELEGRAM_CHAT_ID", "")
+    GITHUB_TOKEN = os.getenv("MAESTRO_GITHUB_TOKEN", "")
+    GITHUB_REPO = os.getenv("MAESTRO_GITHUB_REPO", "")
+    DEFAULT_LOCAL_MODEL = os.getenv("MAESTRO_LOCAL_MODEL", "qwen2.5:7b")
+    DEFAULT_API_MODEL = os.getenv("MAESTRO_API_MODEL", "deepseek-chat")
+    ESTATE_AUDIT_PATH = os.getenv("MAESTRO_AUDIT", "~/.estate/audit.json")
+    INTENT_LOG_DIR = os.getenv("MAESTRO_INTENTS", "~/.maestro/intents")
+    SKILLS_DIR = os.getenv("MAESTRO_SKILLS", "~/.maestro/skills")
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# LOGGING
+# ───────────────────────────────────────────────────────────────────────────────
+
+os.makedirs(os.path.expanduser("~/.maestro"), exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(os.path.expanduser("~/.maestro/maestro.log"))
+    ]
+)
+logger = logging.getLogger("maestro")
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# STATE MACHINE
+# ───────────────────────────────────────────────────────────────────────────────
+
+class State(Enum):
+    IDLE = auto()
+    SENSE = auto()
+    ORIENT = auto()
+    DECIDE = auto()
+    ACT = auto()
+    VERIFY = auto()
+    REPORT = auto()
+    CRISIS = auto()
+    META_REVIEW = auto()
+
+class Priority(Enum):
+    P0 = 0
+    P1 = 1
+    P2 = 2
+    P3 = 3
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# DATA CLASSES
+# ───────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class Episode:
+    id: str
+    timestamp: str
+    lane: str
+    trigger: str
+    action: str
+    outcome: str
+    evidence: Dict[str, Any] = field(default_factory=dict)
+    duration_ms: int = 0
+    cost_usd: float = 0.0
+    shape_id: Optional[str] = None
+
+@dataclass
+class Shape:
+    id: str
+    pattern_name: str
+    morphology: Dict[str, Any] = field(default_factory=dict)
+    contexts_observed: List[str] = field(default_factory=list)
+    invariant_violated: str = ""
+    prevention_skill: str = ""
+    first_seen: str = ""
+    last_seen: str = ""
+    occurrence_count: int = 0
+    prevention_success_rate: float = 0.0
+    confidence: float = 0.0
+
+@dataclass
+class Skill:
+    id: str
+    name: str
+    lane: str
+    trigger_pattern: str
+    procedure: str
+    success_rate: float = 0.0
+    total_uses: int = 0
+    created_from_shape: Optional[str] = None
+    last_used: str = ""
+    avg_duration_ms: int = 0
+
+@dataclass
+class Intent:
+    id: str
+    timestamp: str
+    trigger: str
+    state_transitions: List[str] = field(default_factory=list)
+    orient_analysis: Dict[str, Any] = field(default_factory=dict)
+    decision: Dict[str, Any] = field(default_factory=dict)
+    execution: Dict[str, Any] = field(default_factory=dict)
+    verification: Dict[str, Any] = field(default_factory=dict)
+    laws_applied: List[str] = field(default_factory=list)
+    laws_violated: List[str] = field(default_factory=list)
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# EXPERIENCE GRAPH (SQLite)
+# ───────────────────────────────────────────────────────────────────────────────
+
+class ExperienceGraph:
+    def __init__(self, db_path: str):
+        self.db_path = os.path.expanduser(db_path)
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        self._init_schema()
+
+    def _init_schema(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS episodes (
+                    id TEXT PRIMARY KEY,
+                    timestamp TEXT NOT NULL,
+                    lane TEXT,
+                    trigger TEXT,
+                    action TEXT,
+                    outcome TEXT,
+                    evidence TEXT,
+                    duration_ms INTEGER DEFAULT 0,
+                    cost_usd REAL DEFAULT 0.0,
+                    shape_id TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_episodes_time ON episodes(timestamp);
+                CREATE INDEX IF NOT EXISTS idx_episodes_lane ON episodes(lane);
+                CREATE INDEX IF NOT EXISTS idx_episodes_shape ON episodes(shape_id);
+
+                CREATE TABLE IF NOT EXISTS shapes (
+                    id TEXT PRIMARY KEY,
+                    pattern_name TEXT NOT NULL,
+                    morphology TEXT,
+                    contexts_observed TEXT,
+                    invariant_violated TEXT,
+                    prevention_skill TEXT,
+                    first_seen TEXT,
+                    last_seen TEXT,
+                    occurrence_count INTEGER DEFAULT 0,
+                    prevention_success_rate REAL DEFAULT 0.0,
+                    confidence REAL DEFAULT 0.0
+                );
+                CREATE INDEX IF NOT EXISTS idx_shapes_name ON shapes(pattern_name);
+
+                CREATE TABLE IF NOT EXISTS skills (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    lane TEXT,
+                    trigger_pattern TEXT,
+                    procedure TEXT,
+                    success_rate REAL DEFAULT 0.0,
+                    total_uses INTEGER DEFAULT 0,
+                    created_from_shape TEXT,
+                    last_used TEXT,
+                    avg_duration_ms INTEGER DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_skills_lane ON skills(lane);
+
+                CREATE TABLE IF NOT EXISTS invariants (
+                    id TEXT PRIMARY KEY,
+                    law_name TEXT NOT NULL,
+                    violations_prevented INTEGER DEFAULT 0,
+                    violations_allowed INTEGER DEFAULT 0,
+                    last_enforced TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS conversations (
+                    id TEXT PRIMARY KEY,
+                    timestamp TEXT,
+                    role TEXT,
+                    content TEXT,
+                    context_summary TEXT,
+                    session_id TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_conv_session ON conversations(session_id);
+
+                CREATE TABLE IF NOT EXISTS daily_spend (
+                    date TEXT PRIMARY KEY,
+                    amount_usd REAL DEFAULT 0.0
+                );
+            """)
+
+    def log_episode(self, episode: Episode) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT INTO episodes
+                (id, timestamp, lane, trigger, action, outcome, evidence,
+                 duration_ms, cost_usd, shape_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                episode.id, episode.timestamp, episode.lane, episode.trigger,
+                episode.action, episode.outcome, json.dumps(episode.evidence),
+                episode.duration_ms, episode.cost_usd, episode.shape_id
+            ))
+
+    def get_shapes(self, pattern_name: Optional[str] = None) -> List[Shape]:
+        with sqlite3.connect(self.db_path) as conn:
+            if pattern_name:
+                rows = conn.execute(
+                    "SELECT * FROM shapes WHERE pattern_name = ?", (pattern_name,)
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM shapes").fetchall()
+            return [self._row_to_shape(r) for r in rows]
+
+    def get_shape_by_context(self, context: str) -> List[Shape]:
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT * FROM shapes WHERE contexts_observed LIKE ?", (f"%{context}%",)
+            ).fetchall()
+            return [self._row_to_shape(r) for r in rows]
+
+    def upsert_shape(self, shape: Shape) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT INTO shapes
+                (id, pattern_name, morphology, contexts_observed, invariant_violated,
+                 prevention_skill, first_seen, last_seen, occurrence_count,
+                 prevention_success_rate, confidence)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    occurrence_count = excluded.occurrence_count,
+                    last_seen = excluded.last_seen,
+                    prevention_success_rate = excluded.prevention_success_rate,
+                    confidence = excluded.confidence,
+                    contexts_observed = excluded.contexts_observed
+            """, (
+                shape.id, shape.pattern_name, json.dumps(shape.morphology),
+                json.dumps(shape.contexts_observed), shape.invariant_violated,
+                shape.prevention_skill, shape.first_seen, shape.last_seen,
+                shape.occurrence_count, shape.prevention_success_rate, shape.confidence
+            ))
+
+    def get_skill(self, skill_id: str) -> Optional[Skill]:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute("SELECT * FROM skills WHERE id = ?", (skill_id,)).fetchone()
+            if not row:
+                return None
+            return self._row_to_skill(row)
+
+    def get_skills_for_lane(self, lane: str) -> List[Skill]:
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute("SELECT * FROM skills WHERE lane = ?", (lane,)).fetchall()
+            return [self._row_to_skill(r) for r in rows]
+
+    def upsert_skill(self, skill: Skill) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT INTO skills
+                (id, name, lane, trigger_pattern, procedure, success_rate,
+                 total_uses, created_from_shape, last_used, avg_duration_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    success_rate = excluded.success_rate,
+                    total_uses = excluded.total_uses,
+                    last_used = excluded.last_used,
+                    avg_duration_ms = excluded.avg_duration_ms
+            """, (
+                skill.id, skill.name, skill.lane, skill.trigger_pattern,
+                skill.procedure, skill.success_rate, skill.total_uses,
+                skill.created_from_shape, skill.last_used, skill.avg_duration_ms
+            ))
+
+    def get_daily_spend(self, date: str) -> float:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT amount_usd FROM daily_spend WHERE date = ?", (date,)
+            ).fetchone()
+            return row[0] if row else 0.0
+
+    def add_spend(self, amount_usd: float) -> None:
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT INTO daily_spend (date, amount_usd)
+                VALUES (?, ?)
+                ON CONFLICT(date) DO UPDATE SET
+                    amount_usd = amount_usd + excluded.amount_usd
+            """, (today, amount_usd))
+
+    def get_stats(self) -> Dict[str, Any]:
+        with sqlite3.connect(self.db_path) as conn:
+            total_episodes = conn.execute("SELECT COUNT(*) FROM episodes").fetchone()[0]
+            total_shapes = conn.execute("SELECT COUNT(*) FROM shapes").fetchone()[0]
+            total_skills = conn.execute("SELECT COUNT(*) FROM skills").fetchone()[0]
+            success_rate = conn.execute(
+                "SELECT AVG(CASE WHEN outcome='success' THEN 1.0 ELSE 0.0 END) FROM episodes"
+            ).fetchone()[0] or 0.0
+            today_spend = self.get_daily_spend(datetime.utcnow().strftime("%Y-%m-%d"))
+            return {
+                "total_episodes": total_episodes,
+                "total_shapes": total_shapes,
+                "total_skills": total_skills,
+                "success_rate": round(success_rate, 3),
+                "today_spend_usd": round(today_spend, 2),
+            }
+
+    @staticmethod
+    def _row_to_shape(row) -> Shape:
+        return Shape(
+            id=row[0], pattern_name=row[1],
+            morphology=json.loads(row[2]) if row[2] else {},
+            contexts_observed=json.loads(row[3]) if row[3] else [],
+            invariant_violated=row[4], prevention_skill=row[5],
+            first_seen=row[6], last_seen=row[7],
+            occurrence_count=row[8], prevention_success_rate=row[9],
+            confidence=row[10]
+        )
+
+    @staticmethod
+    def _row_to_skill(row) -> Skill:
+        return Skill(
+            id=row[0], name=row[1], lane=row[2],
+            trigger_pattern=row[3], procedure=row[4],
+            success_rate=row[5], total_uses=row[6],
+            created_from_shape=row[7], last_used=row[8],
+            avg_duration_ms=row[9]
+        )
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# THE 7 LAWS — CONSTITUTIONAL INVARIANTS
+# ───────────────────────────────────────────────────────────────────────────────
+
+class LawViolation(Exception):
+    def __init__(self, law_name: str, reason: str, evidence: Dict = None):
+        self.law_name = law_name
+        self.reason = reason
+        self.evidence = evidence or {}
+        super().__init__(f"LAW_VIOLATION: {law_name} — {reason}")
+
+class LawMiddleware:
+    @classmethod
+    def validate(cls, plan: Dict, context: Dict, graph: ExperienceGraph) -> List[str]:
+        applied = []
+
+        applied.append("LAW_CONTEXT")
+        if not cls._law_context(plan, context):
+            raise LawViolation("LAW_CONTEXT",
+                f"Plan domain '{plan.get('domain', 'unknown')}' not in allowed contexts")
+
+        applied.append("LAW_DEGREE")
+        if not cls._law_degree(plan):
+            raise LawViolation("LAW_DEGREE",
+                "Plan contains binary assessment without scalar metric")
+
+        applied.append("LAW_BASELINE")
+        if not cls._law_baseline(plan):
+            raise LawViolation("LAW_BASELINE",
+                "Plan claims improvement without baseline comparison")
+
+        applied.append("LAW_TRADEOFF")
+        if not cls._law_tradeoff(plan):
+            raise LawViolation("LAW_TRADEOFF",
+                "Plan does not surface invisible costs")
+
+        applied.append("LAW_RIPPLE")
+        if not cls._law_ripple(plan, depth=2):
+            raise LawViolation("LAW_RIPPLE",
+                f"Plan traces insufficient ripple effects")
+
+        applied.append("LAW_MECHANISM")
+        if not cls._law_mechanism(plan):
+            raise LawViolation("LAW_MECHANISM",
+                "Plan mechanism is hand-waving")
+
+        applied.append("LAW_SOURCE")
+        if not cls._law_source(plan):
+            raise LawViolation("LAW_SOURCE",
+                "Plan uses unattributed data")
+
+        return applied
+
+    @staticmethod
+    def _law_context(plan: Dict, context: Dict) -> bool:
+        allowed = context.get("allowed_domains", ["estate", "research", "meta"])
+        domain = plan.get("domain", "unknown")
+        return domain in allowed or domain == "meta"
+
+    @staticmethod
+    def _law_degree(plan: Dict) -> bool:
+        assessments = plan.get("assessments", {})
+        if not assessments:
+            return True
+        for key, val in assessments.items():
+            if isinstance(val, bool):
+                return False
+            if isinstance(val, dict):
+                if "value" not in val or "threshold" not in val:
+                    return False
+        return True
+
+    @staticmethod
+    def _law_baseline(plan: Dict) -> bool:
+        baseline = plan.get("baseline")
+        if baseline is None and plan.get("outcome_claim") in ["improved", "better", "faster"]:
+            return False
+        return True
+
+    @staticmethod
+    def _law_tradeoff(plan: Dict) -> bool:
+        tradeoffs = plan.get("tradeoffs", [])
+        if not plan.get("actions"):
+            return True
+        return len(tradeoffs) > 0
+
+    @staticmethod
+    def _law_ripple(plan: Dict, depth: int = 2) -> bool:
+        effects = plan.get("ripple_effects", [])
+        max_depth = 0
+        for effect in effects:
+            d = 1
+            current = effect
+            while isinstance(current, dict) and "then" in current:
+                d += 1
+                current = current["then"]
+            max_depth = max(max_depth, d)
+        return max_depth >= depth or len(effects) == 0
+
+    @staticmethod
+    def _law_mechanism(plan: Dict) -> bool:
+        mechanism = plan.get("mechanism", "")
+        if not mechanism:
+            return True
+        steps = [s for s in mechanism.split("\n") if s.strip()]
+        return len(steps) >= 2 and all(len(s.strip()) > 10 for s in steps)
+
+    @staticmethod
+    def _law_source(plan: Dict) -> bool:
+        evidence_nodes = plan.get("evidence", {})
+        if not evidence_nodes:
+            return True
+        for key, val in evidence_nodes.items():
+            if isinstance(val, dict) and "source" not in val:
+                return False
+        return True
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# SHAPE EXTRACTOR
+# ───────────────────────────────────────────────────────────────────────────────
+
+class ShapeExtractor:
+    KNOWN_PATTERNS = {
+        "resource-exhaustion-monotonic": {
+            "triggers": ["disk full", "memory full", "connection pool exhausted", "GPU OOM"],
+            "mechanism": "monotonic growth of ephemeral artifact without cleanup",
+            "contexts": ["disk", "memory", "network", "gpu"],
+            "invariant": "LAW_RIPPLE",
+        },
+        "retry-storm-no-backoff": {
+            "triggers": ["infinite loop", "retry exceeded", "timeout cascade", "connection refused loop"],
+            "mechanism": "failure triggers immediate retry with no state change, identical failure recurs",
+            "contexts": ["api", "db", "git", "file-lock"],
+            "invariant": "LAW_DEGREE",
+        },
+        "manual-intervention-left-in-production": {
+            "triggers": ["debug flag set", "temp file old", "cron commented", "firewall rule open"],
+            "mechanism": "temporary change made for debugging, never reverted, silently decays",
+            "contexts": ["config", "cron", "firewall", "env", "feature-flag"],
+            "invariant": "LAW_RIPPLE",
+        },
+        "scope-creep-sidequest": {
+            "triggers": ["task expanded", "unrelated files touched", "goal drift", "original issue abandoned"],
+            "mechanism": "agent expands task scope beyond original goal, loses focus, original deliverable delayed",
+            "contexts": ["coding", "research", "writing", "analysis"],
+            "invariant": "LAW_CONTEXT",
+        },
+        "credential-leak-surface": {
+            "triggers": ["key in log", "token in history", "password in diff", "secret in env"],
+            "mechanism": "sensitive material written to durable surface without redaction",
+            "contexts": ["shell-history", "git-log", "log-file", "env-var", "config-file"],
+            "invariant": "LAW_TRADEOFF",
+        },
+    }
+
+    def __init__(self, graph: ExperienceGraph):
+        self.graph = graph
+
+    def extract(self, episode: Episode) -> Optional[Shape]:
+        for pattern_id, pattern in self.KNOWN_PATTERNS.items():
+            if self._matches_pattern(episode, pattern):
+                return self._create_or_update_shape(pattern_id, pattern, episode)
+        logger.info(f"Novel incident logged: {episode.id}")
+        return None
+
+    def _matches_pattern(self, episode: Episode, pattern: Dict) -> bool:
+        trigger_lower = episode.trigger.lower()
+        action_lower = episode.action.lower()
+        return any(t in trigger_lower or t in action_lower for t in pattern["triggers"])
+
+    def _create_or_update_shape(self, pattern_id: str, pattern: Dict, episode: Episode) -> Shape:
+        existing = self.graph.get_shapes(pattern_name=pattern_id)
+
+        if existing:
+            shape = existing[0]
+            shape.occurrence_count += 1
+            shape.last_seen = episode.timestamp
+            if episode.lane not in shape.contexts_observed:
+                shape.contexts_observed.append(episode.lane)
+            if episode.outcome == "prevented":
+                successes = shape.prevention_success_rate * (shape.occurrence_count - 1)
+                shape.prevention_success_rate = (successes + 1) / shape.occurrence_count
+        else:
+            shape = Shape(
+                id=pattern_id,
+                pattern_name=pattern_id,
+                morphology={
+                    "trigger_keywords": pattern["triggers"],
+                    "mechanism": pattern["mechanism"],
+                },
+                contexts_observed=[episode.lane],
+                invariant_violated=pattern["invariant"],
+                prevention_skill=f"skills/{pattern_id}.py",
+                first_seen=episode.timestamp,
+                last_seen=episode.timestamp,
+                occurrence_count=1,
+                prevention_success_rate=0.0,
+                confidence=0.7
+            )
+
+        self.graph.upsert_shape(shape)
+        return shape
+
+    def find_prevention(self, trigger: str, lane: str) -> Optional[Skill]:
+        shapes = self.graph.get_shape_by_context(lane)
+        for shape in shapes:
+            if shape.prevention_success_rate > 0.5 and shape.confidence > 0.5:
+                triggers = shape.morphology.get("trigger_keywords", [])
+                if any(t in trigger.lower() for t in triggers):
+                    skill = self.graph.get_skill(shape.prevention_skill)
+                    if skill:
+                        return skill
+        return None
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# TELEGRAM BRIDGE
+# ───────────────────────────────────────────────────────────────────────────────
+
+class TelegramBridge:
+    def __init__(self, token: str, chat_id: str, graph: ExperienceGraph):
+        self.token = token
+        self.chat_id = chat_id
+        self.graph = graph
+        self.enabled = bool(token and chat_id)
+
+    def send(self, message: str, priority: Priority = Priority.P2) -> bool:
+        if not self.enabled:
+            logger.info(f"[TELEGRAM would send]: {message}")
+            return True
+        if priority == Priority.P3:
+            return True
+
+        try:
+            import urllib.request
+            import urllib.parse
+            url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+            data = urllib.parse.urlencode({
+                "chat_id": self.chat_id,
+                "text": message,
+                "parse_mode": "Markdown"
+            }).encode()
+            req = urllib.request.Request(url, data=data, method="POST")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status == 200
+        except Exception as e:
+            logger.error(f"Telegram send failed: {e}")
+            return False
+
+    def send_digest(self, stats: Dict, incidents: List[Dict], needs_human: List[Dict]) -> bool:
+        lines = [
+            "🏠 *Estate Digest*",
+            f"\n📊 Stats: {stats['total_episodes']} episodes, "
+            f"{stats['total_shapes']} shapes, {stats['total_skills']} skills",
+            f"💰 Today: ${stats['today_spend_usd']:.2f} / ${Config.MAX_DAILY_SPEND_USD:.0f}",
+        ]
+
+        if needs_human:
+            lines.append(f"\n⚠️ *Need you: {len(needs_human)}*")
+            for item in needs_human:
+                lines.append(f"  • {item['description']}")
+
+        if incidents:
+            lines.append(f"\n✅ *Auto-resolved: {len(incidents)}*")
+            for inc in incidents:
+                lines.append(f"  • {inc['description']}")
+
+        if not needs_human and not incidents:
+            lines.append("\n✅ All clear. Nothing needs you.")
+
+        return self.send("\n".join(lines), Priority.P2)
+
+    def poll_commands(self) -> List[Dict]:
+        if not self.enabled:
+            return []
+        try:
+            import urllib.request
+            url = f"https://api.telegram.org/bot{self.token}/getUpdates?offset=-10"
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                data = json.loads(resp.read())
+                commands = []
+                for update in data.get("result", []):
+                    msg = update.get("message", {})
+                    text = msg.get("text", "")
+                    if text.startswith("/"):
+                        commands.append({
+                            "command": text.split()[0],
+                            "args": text.split()[1:],
+                            "from": msg.get("from", {}).get("id"),
+                            "timestamp": msg.get("date")
+                        })
+                return commands
+        except Exception as e:
+            logger.error(f"Telegram poll failed: {e}")
+            return []
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# ESTATE SENSORS
+# ───────────────────────────────────────────────────────────────────────────────
+
+class EstateSensors:
+    def __init__(self):
+        self.audit_path = os.path.expanduser(Config.ESTATE_AUDIT_PATH)
+
+    def read_audit(self) -> List[Dict]:
+        if not os.path.exists(self.audit_path):
+            logger.warning(f"Audit file not found: {self.audit_path}")
+            return []
+        try:
+            with open(self.audit_path) as f:
+                data = json.load(f)
+                return data.get("findings", [])
+        except Exception as e:
+            logger.error(f"Failed to read audit: {e}")
+            return []
+
+    def check_bridges(self) -> List[Dict]:
+        findings = []
+        bridges = [("kimi-bridge", 8765), ("deepseek-bridge", 8767), ("ollama", 11434)]
+        for name, port in bridges:
+            try:
+                import socket
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2)
+                result = sock.connect_ex(("127.0.0.1", port))
+                sock.close()
+                if result != 0:
+                    findings.append({
+                        "id": f"bridge-down-{name}",
+                        "severity": "P1",
+                        "lane": "estate",
+                        "description": f"{name} not responding on port {port}",
+                        "auto_fix": True,
+                        "skill": "restart_bridge",
+                        "context": {"bridge_name": name, "port": port}
+                    })
+            except Exception as e:
+                logger.error(f"Bridge check failed for {name}: {e}")
+        return findings
+
+    def check_disk(self) -> List[Dict]:
+        findings = []
+        try:
+            stat = os.statvfs("/")
+            percent = (stat.f_blocks - stat.f_bfree) / stat.f_blocks * 100
+            if percent > 90:
+                findings.append({
+                    "id": "disk-critical",
+                    "severity": "P0",
+                    "lane": "estate",
+                    "description": f"Disk at {percent:.1f}%",
+                    "auto_fix": True,
+                    "skill": "disk_cleanup",
+                    "context": {"percent": percent, "threshold": 90}
+                })
+            elif percent > 80:
+                findings.append({
+                    "id": "disk-warning",
+                    "severity": "P1",
+                    "lane": "estate",
+                    "description": f"Disk at {percent:.1f}%",
+                    "auto_fix": True,
+                    "skill": "disk_cleanup",
+                    "context": {"percent": percent, "threshold": 80}
+                })
+        except Exception as e:
+            logger.error(f"Disk check failed: {e}")
+        return findings
+
+    def check_credentials(self) -> List[Dict]:
+        findings = []
+        history_paths = [
+            os.path.expanduser("~/.bash_history"),
+            os.path.expanduser("~/.zsh_history"),
+            os.path.expanduser("~/.claude/history.jsonl"),
+        ]
+        patterns = [
+            (r"sk-ant-api[0-9a-zA-Z-_]{100,}", "Anthropic API key"),
+            (r"sk_live_[a-zA-Z0-9]{40,}", "Stripe live key"),
+            (r"hf_[a-zA-Z0-9]{30,}", "HuggingFace token"),
+            (r"ghp_[a-zA-Z0-9]{36,}", "GitHub token"),
+        ]
+
+        for hist_path in history_paths:
+            if not os.path.exists(hist_path):
+                continue
+            try:
+                with open(hist_path, "rb") as f:
+                    content = f.read().decode("utf-8", errors="ignore")
+                    for pattern, name in patterns:
+                        import re
+                        if re.search(pattern, content):
+                            findings.append({
+                                "id": f"credential-leak-{name.lower().replace(' ', '-')}",
+                                "severity": "P0",
+                                "lane": "estate",
+                                "description": f"{name} found in {hist_path}",
+                                "auto_fix": False,
+                                "skill": "credential_rotation",
+                                "context": {"file": hist_path, "key_type": name}
+                            })
+            except Exception as e:
+                logger.error(f"Credential scan failed for {hist_path}: {e}")
+        return findings
+
+    def sense(self) -> List[Dict]:
+        findings = []
+        findings.extend(self.read_audit())
+        findings.extend(self.check_bridges())
+        findings.extend(self.check_disk())
+        findings.extend(self.check_credentials())
+        return findings
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# SKILL EXECUTOR
+# ───────────────────────────────────────────────────────────────────────────────
+
+class SkillExecutor:
+    ALLOWED_PATHS = [
+        os.path.expanduser("~/.estate"),
+        os.path.expanduser("~/.maestro"),
+        os.path.expanduser("~/prospector"),
+        "/tmp",
+    ]
+
+    DANGEROUS_PATTERNS = [
+        r"rm\s+-rf\s+/",
+        r"rm\s+-rf\s+~",
+        r":\s*\{\s*:\s*\}\s*;\s*while",
+        r"mkfs\.",
+        r"dd\s+if=.*of=/dev/",
+    ]
+
+    def __init__(self, graph: ExperienceGraph):
+        self.graph = graph
+
+    def execute(self, skill: Skill, context: Dict) -> Tuple[bool, Dict]:
+        start = time.time()
+        evidence = {"skill_id": skill.id, "context": context}
+
+        if not self._path_safe(skill.procedure):
+            return False, {**evidence, "error": "Path violation", "blocked": True}
+
+        if self._dangerous_detected(skill.procedure):
+            return False, {**evidence, "error": "Dangerous pattern detected", "blocked": True}
+
+        try:
+            if skill.procedure.startswith("shell:"):
+                cmd = skill.procedure.replace("shell:", "").strip()
+                result = subprocess.run(
+                    cmd, shell=True, capture_output=True, text=True,
+                    timeout=300, cwd=context.get("cwd", "/tmp")
+                )
+                success = result.returncode == 0
+                evidence["stdout"] = result.stdout[:2000]
+                evidence["stderr"] = result.stderr[:2000]
+                evidence["returncode"] = result.returncode
+            elif skill.procedure.startswith("python:"):
+                code = skill.procedure.replace("python:", "").strip()
+                namespace = {"__builtins__": {}}
+                exec(code, namespace)
+                success = namespace.get("__result__", False)
+                evidence["result"] = success
+            else:
+                success = False
+                evidence["error"] = f"Unknown procedure type: {skill.procedure[:50]}"
+
+            duration_ms = int((time.time() - start) * 1000)
+            evidence["duration_ms"] = duration_ms
+
+            skill.total_uses += 1
+            skill.last_used = datetime.utcnow().isoformat()
+            skill.avg_duration_ms = int(
+                (skill.avg_duration_ms * (skill.total_uses - 1) + duration_ms) / skill.total_uses
+            )
+            if success:
+                skill.success_rate = (skill.success_rate * (skill.total_uses - 1) + 1.0) / skill.total_uses
+            else:
+                skill.success_rate = (skill.success_rate * (skill.total_uses - 1)) / skill.total_uses
+
+            self.graph.upsert_skill(skill)
+            return success, evidence
+
+        except Exception as e:
+            evidence["error"] = str(e)
+            evidence["duration_ms"] = int((time.time() - start) * 1000)
+            return False, evidence
+
+    def _path_safe(self, procedure: str) -> bool:
+        suspicious = ["/etc/", "/usr/", "/bin/", "/sbin/", "/var/", "/home/"]
+        for s in suspicious:
+            if s in procedure and not any(a in procedure for a in self.ALLOWED_PATHS):
+                return False
+        return True
+
+    def _dangerous_detected(self, procedure: str) -> bool:
+        import re
+        for pattern in self.DANGEROUS_PATTERNS:
+            if re.search(pattern, procedure):
+                return True
+        return False
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# THE MAESTRO
+# ───────────────────────────────────────────────────────────────────────────────
+
+class Maestro:
+    def __init__(self):
+        self.db = ExperienceGraph(Config.DB_PATH)
+        self.extractor = ShapeExtractor(self.db)
+        self.bridge = TelegramBridge(Config.TELEGRAM_TOKEN, Config.TELEGRAM_CHAT_ID, self.db)
+        self.sensors = EstateSensors()
+        self.executor = SkillExecutor(self.db)
+        self.state = State.IDLE
+        self.current_intent: Optional[Intent] = None
+        self.crisis_mode = False
+        self.last_meta_review = datetime.utcnow() - timedelta(hours=25)
+        self.daily_findings: List[Dict] = []
+        self.daily_resolved: List[Dict] = []
+        self.daily_needs_human: List[Dict] = []
+        self._seed_invariants()
+
+    def _seed_invariants(self):
+        laws = ["LAW_CONTEXT", "LAW_DEGREE", "LAW_BASELINE",
+                "LAW_TRADEOFF", "LAW_RIPPLE", "LAW_MECHANISM", "LAW_SOURCE"]
+        with sqlite3.connect(self.db.db_path) as conn:
+            for law in laws:
+                conn.execute("""
+                    INSERT OR IGNORE INTO invariants (id, law_name, last_enforced)
+                    VALUES (?, ?, ?)
+                """, (law, law, datetime.utcnow().isoformat()))
+
+    def _new_intent(self, trigger: str) -> Intent:
+        self.current_intent = Intent(
+            id=f"INTENT-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-{hashlib.sha256(trigger.encode()).hexdigest()[:8]}",
+            timestamp=datetime.utcnow().isoformat(),
+            trigger=trigger,
+            state_transitions=["IDLE"]
+        )
+        return self.current_intent
+
+    def _transition(self, new_state: State):
+        self.state = new_state
+        if self.current_intent:
+            self.current_intent.state_transitions.append(new_state.name)
+        logger.info(f"State: {new_state.name}")
+
+    def _save_intent(self):
+        if not self.current_intent:
+            return
+        intent_dir = os.path.expanduser(Config.INTENT_LOG_DIR)
+        os.makedirs(intent_dir, exist_ok=True)
+        path = os.path.join(intent_dir, f"{self.current_intent.id}.json")
+        with open(path, "w") as f:
+            json.dump(asdict(self.current_intent), f, indent=2, default=str)
+
+    def tick(self):
+        try:
+            if self.state == State.IDLE:
+                self._do_idle()
+            elif self.state == State.SENSE:
+                self._do_sense()
+            elif self.state == State.ORIENT:
+                self._do_orient()
+            elif self.state == State.DECIDE:
+                self._do_decide()
+            elif self.state == State.ACT:
+                self._do_act()
+            elif self.state == State.VERIFY:
+                self._do_verify()
+            elif self.state == State.REPORT:
+                self._do_report()
+            elif self.state == State.CRISIS:
+                self._do_crisis()
+            elif self.state == State.META_REVIEW:
+                self._do_meta_review()
+        except Exception as e:
+            logger.exception("Tick failed")
+            self._transition(State.IDLE)
+            self._save_intent()
+
+    def _do_idle(self):
+        self._new_intent("periodic_tick")
+        if self.crisis_mode:
+            self._transition(State.CRISIS)
+            return
+        if datetime.utcnow() - self.last_meta_review > timedelta(hours=Config.META_REVIEW_INTERVAL_HOURS):
+            self._transition(State.META_REVIEW)
+            return
+        self._transition(State.SENSE)
+
+    def _do_sense(self):
+        findings = self.sensors.sense()
+        self.daily_findings.extend(findings)
+        p0s = [f for f in findings if f.get("severity") == "P0"]
+        if p0s:
+            self.crisis_mode = True
+            self._transition(State.CRISIS)
+            return
+        if findings:
+            self._transition(State.ORIENT)
+        else:
+            self._transition(State.REPORT)
+
+    def _do_orient(self):
+        intent = self.current_intent
+        intent.orient_analysis["findings"] = len(self.daily_findings)
+        intent.orient_analysis["shapes_matched"] = 0
+        intent.orient_analysis["novel"] = 0
+
+        for finding in self.daily_findings:
+            prevention = self.extractor.find_prevention(
+                finding["description"], finding.get("lane", "estate")
+            )
+            if prevention:
+                finding["prevention_skill"] = prevention.id
+                finding["prevention_available"] = True
+                intent.orient_analysis["shapes_matched"] += 1
+            else:
+                episode = Episode(
+                    id=f"EP-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{hashlib.sha256(finding['id'].encode()).hexdigest()[:6]}",
+                    timestamp=datetime.utcnow().isoformat(),
+                    lane=finding.get("lane", "estate"),
+                    trigger=finding["description"],
+                    action="detected",
+                    outcome="unknown"
+                )
+                shape = self.extractor.extract(episode)
+                if shape:
+                    finding["shape_extracted"] = shape.id
+                    intent.orient_analysis["shapes_matched"] += 1
+                else:
+                    intent.orient_analysis["novel"] += 1
+
+        self._transition(State.DECIDE)
+
+    def _do_decide(self):
+        intent = self.current_intent
+        intent.decision["auto_fix"] = []
+        intent.decision["queue"] = []
+        intent.decision["escalate"] = []
+
+        for finding in self.daily_findings:
+            lane = finding.get("lane", "estate")
+            lane_config = Config.LANES.get(lane, Config.LANES["estate"])
+
+            plan = {
+                "domain": lane,
+                "assessments": {
+                    "severity": {"value": finding.get("severity", "P2"), "threshold": "P1", "rate": "static"}
+                },
+                "baseline": "previous_state_normal",
+                "tradeoffs": [{"cost": "time", "probability": 0.3, "impact": "delay"}],
+                "ripple_effects": [{"effect": "service_restart", "then": {"effect": "brief_downtime"}}],
+                "mechanism": finding.get("skill", "unknown") + " execution with verification",
+                "sources": [{"source": "estate_audit", "retrieval_date": datetime.utcnow().isoformat(), "confidence": 0.9}]
+            }
+
+            try:
+                laws = LawMiddleware.validate(plan, {"allowed_domains": list(Config.LANES.keys())}, self.db)
+                intent.laws_applied.extend(laws)
+            except LawViolation as e:
+                intent.laws_violated.append({"law": e.law_name, "reason": e.reason})
+                finding["route"] = "escalate"
+                finding["reason"] = f"Law violation: {e.law_name}"
+                intent.decision["escalate"].append(finding)
+                continue
+
+            if finding.get("severity") == "P0":
+                finding["route"] = "escalate"
+                intent.decision["escalate"].append(finding)
+            elif finding.get("auto_fix") and lane_config["auto_fix"]:
+                finding["route"] = "auto_fix"
+                intent.decision["auto_fix"].append(finding)
+            else:
+                finding["route"] = "queue"
+                intent.decision["queue"].append(finding)
+
+        self._transition(State.ACT)
+
+    def _do_act(self):
+        intent = self.current_intent
+        intent.execution["results"] = []
+
+        for finding in intent.decision.get("auto_fix", []):
+            skill_id = finding.get("skill", "generic_fallback")
+            skill = self.db.get_skill(skill_id)
+
+            if not skill:
+                skill = Skill(
+                    id=skill_id,
+                    name=f"Auto-generated fix for {finding['id']}",
+                    lane=finding.get("lane", "estate"),
+                    trigger_pattern=finding["description"],
+                    procedure=f"shell: echo 'Fix for {finding['id']}'",
+                    created_from_shape=finding.get("shape_extracted")
+                )
+                self.db.upsert_skill(skill)
+
+            success, evidence = self.executor.execute(skill, finding.get("context", {}))
+            intent.execution["results"].append({
+                "finding_id": finding["id"],
+                "skill_id": skill.id,
+                "success": success,
+                "evidence": evidence
+            })
+
+            if success:
+                self.daily_resolved.append(finding)
+            else:
+                finding["route"] = "escalate"
+                finding["auto_fix_failed"] = True
+                self.daily_needs_human.append(finding)
+
+        for finding in intent.decision.get("queue", []):
+            self.daily_needs_human.append(finding)
+
+        for finding in intent.decision.get("escalate", []):
+            self.daily_needs_human.append(finding)
+
+        self._transition(State.VERIFY)
+
+    def _do_verify(self):
+        intent = self.current_intent
+        intent.verification["checks"] = []
+        recheck = self.sensors.sense()
+        remaining_ids = {f["id"] for f in recheck}
+
+        for result in intent.execution.get("results", []):
+            if result["success"]:
+                if result["finding_id"] not in remaining_ids:
+                    intent.verification["checks"].append({
+                        "finding_id": result["finding_id"],
+                        "status": "verified_fixed"
+                    })
+                else:
+                    intent.verification["checks"].append({
+                        "finding_id": result["finding_id"],
+                        "status": "fix_failed_still_present"
+                    })
+                    self.daily_needs_human.append(next(
+                        f for f in self.daily_resolved if f["id"] == result["finding_id"]
+                    ))
+
+        self._transition(State.REPORT)
+
+    def _do_report(self):
+        stats = self.db.get_stats()
+
+        if self.daily_needs_human:
+            self.bridge.send_digest(stats, self.daily_resolved, self.daily_needs_human)
+        elif self.daily_resolved:
+            self.bridge.send(f"✅ Auto-resolved {len(self.daily_resolved)} issues. All clear.", Priority.P3)
+        else:
+            logger.info("All clear — no digest sent (P3)")
+
+        for finding in self.daily_resolved:
+            self.db.log_episode(Episode(
+                id=f"EP-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{finding['id']}",
+                timestamp=datetime.utcnow().isoformat(),
+                lane=finding.get("lane", "estate"),
+                trigger=finding["description"],
+                action="auto_fix",
+                outcome="success",
+                evidence=finding.get("context", {}),
+                shape_id=finding.get("shape_extracted")
+            ))
+
+        for finding in self.daily_needs_human:
+            self.db.log_episode(Episode(
+                id=f"EP-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{finding['id']}",
+                timestamp=datetime.utcnow().isoformat(),
+                lane=finding.get("lane", "estate"),
+                trigger=finding["description"],
+                action="escalated",
+                outcome="needs_human",
+                evidence=finding.get("context", {}),
+                shape_id=finding.get("shape_extracted")
+            ))
+
+        self.daily_findings = []
+        self.daily_resolved = []
+        self.daily_needs_human = []
+        self._save_intent()
+        self._transition(State.IDLE)
+
+    def _do_crisis(self):
+        p0_findings = [f for f in self.daily_findings if f.get("severity") == "P0"]
+        self.bridge.send(
+            f"🚨 *CRISIS MODE*\n\n"
+            f"{len(p0_findings)} P0 finding(s):\n" +
+            "\n".join(f"• {f['description']}" for f in p0_findings) +
+            "\n\nAll non-essential lanes frozen. Manual intervention required.",
+            Priority.P0
+        )
+
+        for finding in p0_findings:
+            self.db.log_episode(Episode(
+                id=f"CRISIS-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{finding['id']}",
+                timestamp=datetime.utcnow().isoformat(),
+                lane=finding.get("lane", "estate"),
+                trigger=finding["description"],
+                action="crisis_escalation",
+                outcome="needs_human",
+                evidence=finding.get("context", {})
+            ))
+
+        self.crisis_mode = False
+        self.daily_findings = []
+        self._save_intent()
+        self._transition(State.IDLE)
+
+    def _do_meta_review(self):
+        stats = self.db.get_stats()
+        with sqlite3.connect(self.db.db_path) as conn:
+            yesterday = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+            rows = conn.execute(
+                "SELECT * FROM episodes WHERE timestamp > ?", (yesterday,)
+            ).fetchall()
+
+        failure_shapes = {}
+        for row in rows:
+            if row[5] == "failure":
+                shape_id = row[9]
+                if shape_id:
+                    failure_shapes[shape_id] = failure_shapes.get(shape_id, 0) + 1
+
+        proposals = []
+        for shape_id, count in failure_shapes.items():
+            if count >= 2:
+                proposals.append(f"Shape {shape_id} failed {count} times — review prevention skill")
+
+        if proposals:
+            self.bridge.send(
+                f"📊 *Meta-Review*\n\n"
+                f"24h episodes: {len(rows)}\n"
+                f"Failure patterns: {len(failure_shapes)}\n\n"
+                f"Proposals:\n" + "\n".join(f"• {p}" for p in proposals) +
+                "\n\n[Review on GitHub]",
+                Priority.P2
+            )
+
+        self.last_meta_review = datetime.utcnow()
+        self._transition(State.IDLE)
+
+    def run(self):
+        logger.info("Maestro Deputy v1.0 starting...")
+        logger.info(f"Database: {self.db.db_path}")
+        logger.info(f"Tick interval: {Config.TICK_INTERVAL}s")
+
+        try:
+            while True:
+                self.tick()
+                time.sleep(Config.TICK_INTERVAL)
+        except KeyboardInterrupt:
+            logger.info("Shutting down gracefully...")
+            self._save_intent()
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# CLI ENTRY POINT
+# ───────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Maestro Deputy")
+    parser.add_argument("--once", action="store_true", help="Run one tick and exit")
+    parser.add_argument("--status", action="store_true", help="Print status and exit")
+    parser.add_argument("--init", action="store_true", help="Initialize database and exit")
+    args = parser.parse_args()
+
+    if args.init:
+        db = ExperienceGraph(Config.DB_PATH)
+        print(f"Initialized: {db.db_path}")
+        sys.exit(0)
+
+    if args.status:
+        db = ExperienceGraph(Config.DB_PATH)
+        stats = db.get_stats()
+        print(json.dumps(stats, indent=2))
+        sys.exit(0)
+
+    maestro = Maestro()
+
+    if args.once:
+        maestro.tick()
+    else:
+        maestro.run()
