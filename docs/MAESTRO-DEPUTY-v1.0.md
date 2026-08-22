@@ -4,20 +4,30 @@ Saved 2026-08-22. This is the design document as delivered, reformatted into
 markdown tables and nothing else changed. The code it describes is
 [`../maestro.py`](../maestro.py).
 
-**Missing from this checkout:** the four diagrams below were delivered as sandbox
-links that expired before the document was saved. They are listed so it is clear
-what is absent, not because the files are here.
+The four diagrams were delivered as sandbox links that expired before the
+document was first saved. They were recovered from the founder's Downloads on
+2026-08-22 and now live in [`diagrams/`](diagrams/), embedded below at the
+section each one belongs to. `maestro_analysis.md` is still absent; the
+reflection, simulation and law sections of this document cover the same ground,
+so it is not being reconstructed.
 
 ## What Was Built
 
 | File | Size | Purpose | Present |
 |---|---|---|---|
 | `maestro.py` | 58KB | Core system — state machine, experience graph, 7 Laws, shape extraction, skill execution, Telegram bridge | yes |
-| `maestro_architecture.png` | — | Three-ring architecture: Sense → Think → Act | **no** |
-| `maestro_state_machine.png` | — | 7 states + Crisis loop + Meta loop | **no** |
-| `failure_shape_lifecycle.png` | — | Incident → Causal attribution → Shape → Generalize → Skill → Invariant | **no** |
-| `edge_case_heatmap.png` | — | 20 edge cases ranked by risk score | **no** |
+| `docs/diagrams/maestro_architecture.png` | 158KB | Three-ring architecture: Sense → Think → Act | yes |
+| `docs/diagrams/maestro_state_machine.png` | 131KB | 7 states + Crisis loop + Meta loop | yes |
+| `docs/diagrams/failure_shape_lifecycle.png` | 103KB | Incident → Causal attribution → Shape → Generalize → Skill → Invariant | yes |
+| `docs/diagrams/edge_case_heatmap.png` | 116KB | 20 edge cases ranked by risk score | yes |
 | `maestro_analysis.md` | 17KB | Full self-reflection, simulation results, law formulation | **no** |
+
+![Maestro Deputy architecture: three rings, Sense then Think then Act](diagrams/maestro_architecture.png)
+
+The Think ring is the state machine below, and the seven laws sit under every
+transition in it.
+
+![Maestro Deputy state machine: IDLE, SENSE, ORIENT, DECIDE, ACT, VERIFY, REPORT, with a crisis loop and a meta loop](diagrams/maestro_state_machine.png)
 
 ## The Core Hypothesis as Law
 
@@ -34,6 +44,10 @@ verification strictness.
 abstract the mechanism so it applies everywhere, build a fix, and prove the fix
 works — then that failure will happen less and less often, spreading its
 protection across every part of your system.
+
+That sentence is the lifecycle below, left to right.
+
+![Failure shape lifecycle: incident, causal attribution, shape, generalize, skill, invariant](diagrams/failure_shape_lifecycle.png)
 
 **Falsification conditions.** If any of these happen, the law is wrong:
 
@@ -87,6 +101,11 @@ failure shapes, generalizes them, and prevents recurrence.
 - Cost runaway — meta-review calls LLM hourly instead of daily → $240/day burn
 
 ## Edge Case Analysis
+
+Twenty edge cases, scored by likelihood against blast radius. The two tables
+below are the corners of it.
+
+![Edge case heat map: 20 cases ranked by risk score](diagrams/edge_case_heatmap.png)
 
 Top 5 critical gaps — must fix before production:
 
