@@ -163,6 +163,21 @@ def test_the_receipt_arrives_once_a_week_not_once_a_tick(tmp_path, monkeypatch):
         "a delivered receipt must advance the clock, or it repeats forever"
 
 
+def test_the_receipt_survives_a_standing_crisis(tmp_path, monkeypatch):
+    """Found 2026-08-24 on the live loop: 5 standing P0s made every cycle go
+    SENSE -> CRISIS -> IDLE, so _do_report — and anything that only fires
+    there — was never reached. A week with a standing fire is exactly the
+    week the founder needs the learning numbers, so the crisis path must
+    deliver the receipt too."""
+    m = _maestro(tmp_path, monkeypatch)
+    m.current_intent = _intent()
+    m.daily_findings = [{"id": "stuck", "description": "Standing P0",
+                         "severity": "P0", "lane": "estate"}]
+    m._do_crisis()
+    receipts = [d for d in m.bridge.delivered if "Learning receipt" in d]
+    assert len(receipts) == 1, m.bridge.delivered
+
+
 def test_an_undelivered_receipt_is_retried_not_marked_done(tmp_path, monkeypatch):
     m = _maestro(tmp_path, monkeypatch)
     monkeypatch.setattr(m.bridge, "send", lambda *a, **k: False)
