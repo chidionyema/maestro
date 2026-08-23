@@ -1,0 +1,50 @@
+# maestro had no workflows at all. Measured 2026-08-23: `gh api repos/chidionyema/maestro/actions/
+# workflows` returned `total_count: 0`, and `gh run list` returned nothing. A pull request here
+# therefore carried an empty check list, and an empty check list is not green -- it is unproven.
+#
+# That is why `merge-when-green.yml` refuses to land anything here until this file exists. The
+# refusal was correct and the missing gate was the defect.
+#
+# This is the floor, not a suite. maestro is two Python files and one incident test, all stdlib,
+# so the gate is: it compiles, and the incident test that was written when a real bug bit still
+# passes. Nothing is installed, so the job is seconds rather than minutes.
+name: maestro gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - name: every file compiles
+        run: python -m compileall -q . -x '(\.git|__pycache__)'
+
+      # Incident tests, one per bug, named for the bug. They assert the rule rather than the code,
+      # so they survive a rewrite of maestro.py and are the only category worth hand-writing here.
+      - name: the incident tests still pass
+        run: |
+          python -m pip install -q pytest
+          python -m pytest tests -q
+
+      # maestro.py must never be started directly -- two checkouts share one database and a second
+      # process corrupts the run ledger. bin/ holds the entry point that takes the lock. This step
+      # fails a pull request that reintroduces a direct-start instruction into the docs.
+      - name: nothing tells anyone to start maestro.py directly
+        run: |
+          if grep -rInE '(^|[^a-z/])python3? +maestro\.py' --include='*.md' . ; then
+            echo "::error::docs tell someone to start maestro.py directly; use bin/ instead"
+            exit 1
+          fi
+          echo "clean"

@@ -158,21 +158,31 @@ conversational reasoning. That's 3–6 months, not 1 week.
 
 ## What to Run
 
-```bash
-python3 maestro.py --init      # 1. Initialize the database
-python3 maestro.py --status    # 2. Check status
-python3 maestro.py --once      # 3. Run one tick (dry test)
-python3 maestro.py             # 4. Run continuously (add to launchd/systemd)
-```
-
-Set these first:
+Everything goes through `bin/maestro-run`, which passes its arguments straight to
+`maestro.py`:
 
 ```bash
-export MAESTRO_DB="~/.maestro/experience_graph.db"
-export MAESTRO_TELEGRAM_TOKEN="your_token"
-export MAESTRO_TELEGRAM_CHAT_ID="your_chat_id"
-export MAESTRO_AUDIT="~/.estate/audit.json"
+bin/maestro-run --init      # 1. Initialize the database
+bin/maestro-run --status    # 2. Check status
+bin/maestro-run --once      # 3. Run one tick (dry test)
+bin/maestro-run             # 4. Run continuously (this is what launchd starts)
 ```
+
+**Never start `maestro.py` directly.** Two checkouts of maestro exist on this machine and
+they share one database, so a second process writes into the same run ledger and corrupts
+it. `bin/maestro-run` is the single entry point, and `gate.yml` fails a pull request that
+puts a direct-start instruction back into these docs.
+
+Nothing needs to be exported by hand. `bin/maestro-run` reads the Telegram credentials out
+of the estate's own credential file at `$ESTATE_ENV`, default `~/.config/estate/estate.env`,
+which is the same file `estate_alert.py` reads, so there is one place to rotate. It reports
+whether each credential is present and never prints its value. It refuses to start when one
+is missing rather than POSTing with an empty token, which is what maestro did before the
+wrapper existed: three failed sends, the circuit breaker opened, and the message was
+dropped.
+
+The database path and the audit path default inside the repository and only need setting to
+move them.
 
 ## The Real Question
 
