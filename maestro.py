@@ -637,10 +637,28 @@ class ShapeExtractor:
         self.graph = graph
 
     def extract(self, episode: Episode) -> Optional[Shape]:
-        for pattern_id, pattern in self.KNOWN_PATTERNS.items():
-            if self._matches_pattern(episode, pattern):
-                return self._create_or_update_shape(pattern_id, pattern, episode)
+        pattern_id = self.pattern_for(f"{episode.trigger} {episode.action}")
+        if pattern_id:
+            return self._create_or_update_shape(
+                pattern_id, self.KNOWN_PATTERNS[pattern_id], episode
+            )
         logger.info(f"Novel incident logged: {episode.id}")
+        return None
+
+    def pattern_for(self, text: str) -> Optional[str]:
+        """Which shape does this text belong to, if any.
+
+        One matcher, used by both callers. `extract` classifies an incident on the
+        way in and `find_prevention` classifies it again on the way out, and until
+        today they matched differently: find_prevention compared against
+        `morphology["trigger_keywords"]`, which holds the hand written English
+        phrases, so it answered None for text that `extract` had just classified.
+        """
+        probe = Episode(id="", timestamp="", lane="", trigger=text,
+                        action="", outcome="")
+        for pattern_id, pattern in self.KNOWN_PATTERNS.items():
+            if self._matches_pattern(probe, pattern):
+                return pattern_id
         return None
 
     def _matches_pattern(self, episode: Episode, pattern: Dict) -> bool:
@@ -681,7 +699,7 @@ class ShapeExtractor:
                 },
                 contexts_observed=[episode.lane],
                 invariant_violated=pattern["invariant"],
-                prevention_skill=f"skills/{pattern_id}.py",
+                prevention_skill=pattern_id,
                 first_seen=episode.timestamp,
                 last_seen=episode.timestamp,
                 occurrence_count=1,
@@ -693,15 +711,36 @@ class ShapeExtractor:
         return shape
 
     def find_prevention(self, trigger: str, lane: str) -> Optional[Skill]:
-        shapes = self.graph.get_shape_by_context(lane)
+        """The skill that handles this incident, or None to send it to a person.
+
+        The old gate asked for `shape.prevention_success_rate > 0.5`. A shape is
+        born at 0.0 and that number only moves when its skill runs, so no shape
+        could ever hand over its skill and no skill could ever earn a rate. The
+        loop the whole design rests on could not turn once. The gate belongs on
+        the skill instead: a skill that has never run is allowed exactly the run
+        that gives it a record, and one that has run and mostly failed is not.
+        """
+        pattern_id = self.pattern_for(trigger)
+        if not pattern_id:
+            return None
+        shapes = self.graph.get_shapes(pattern_name=pattern_id)
         for shape in shapes:
-            if shape.prevention_success_rate > 0.5 and shape.confidence > 0.5:
-                triggers = shape.morphology.get("trigger_keywords", [])
-                if any(t in trigger.lower() for t in triggers):
-                    skill = self.graph.get_skill(shape.prevention_skill)
-                    if skill:
-                        return skill
+            if shape.confidence <= 0.5:
+                continue
+            skill = self.graph.get_skill(self._skill_id(shape))
+            if not skill:
+                continue
+            if skill.total_uses == 0 or skill.success_rate > 0.5:
+                return skill
         return None
+
+    @staticmethod
+    def _skill_id(shape: Shape) -> str:
+        """Shapes recorded before 2026-08-23 hold a path, "skills/<name>.py", while
+        the skills table is keyed by bare name, so every lookup missed. New shapes
+        store the bare name; this reads both."""
+        ref = shape.prevention_skill or shape.pattern_name
+        return os.path.basename(ref).removesuffix(".py")
 
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -1475,15 +1514,25 @@ class Maestro:
             skill = self.db.get_skill(skill_id)
 
             if not skill:
-                skill = Skill(
-                    id=skill_id,
-                    name=f"Auto-generated fix for {finding['id']}",
-                    lane=finding.get("lane", "estate"),
-                    trigger_pattern=finding["description"],
-                    procedure=f"shell: echo 'Fix for {finding['id']}'",
-                    created_from_shape=finding.get("shape_extracted")
+                # There is no skill for this. Until today the code wrote one whose
+                # whole procedure was `echo 'Fix for X'`, saved it to the skills
+                # table as though it were real, and then read echo's exit 0 as a
+                # successful repair: the incident was reported resolved and the
+                # graph gained a fake skill that would be trusted next time. An
+                # incident nobody can fix goes to a person, and says why.
+                logger.warning(
+                    f"No skill for {finding['id']} ({skill_id}); escalating instead of inventing one"
                 )
-                self.db.upsert_skill(skill)
+                finding["route"] = "escalate"
+                finding["no_skill"] = skill_id
+                self.daily_needs_human.append(finding)
+                intent.execution["results"].append({
+                    "finding_id": finding["id"],
+                    "skill_id": skill_id,
+                    "success": False,
+                    "evidence": {"reason": "no skill exists for this shape"}
+                })
+                continue
 
             success, evidence = self.executor.execute(skill, finding.get("context", {}))
             intent.execution["results"].append({
