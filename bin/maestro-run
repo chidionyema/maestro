@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Run Maestro with the credentials the estate already holds.
+#
+# Why this file exists. Maestro reads MAESTRO_TELEGRAM_TOKEN and
+# MAESTRO_TELEGRAM_CHAT_ID from the environment and neither was ever set --
+# not in a shell rc, not in any launchd plist. So it POSTed to
+# https://api.telegram.org/bot/sendMessage with an empty token, failed three
+# times, opened its own circuit breaker and dropped the message. Measured
+# 2026-08-23: "Telegram send failed after 3 tries: connection refused", then
+# "Telegram circuit open, dropping a P2 message". The breaker worked. The
+# wiring was never done. By then it had already found a HuggingFace token
+# sitting in ~/.claude/history.jsonl and could not tell anybody.
+#
+# The token is read from the estate's own credential file at run time and is
+# never written into the plist, never echoed and never committed. That file is
+# the same one estate_alert.py uses, so there is one place to rotate.
+#
+# Maestro only ever SENDS. Its poll_commands() calls getUpdates, which Telegram
+# grants to exactly one client, but nothing calls poll_commands() -- checked
+# 2026-08-23, the only reference is its own definition at maestro.py:748. So
+# this cannot take the poll away from The Architect. If a future change starts
+# calling it, that becomes a fourth competitor and the conflict returns.
+set -euo pipefail
+
+ENV_FILE="${ESTATE_ENV:-$HOME/.config/estate/estate.env}"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PY="${MAESTRO_PYTHON:-/usr/local/bin/python3}"
+
+[ -f "$ENV_FILE" ] || { echo "no credential file at $ENV_FILE" >&2; exit 1; }
+
+read_key() {
+    # Minimal parser, same shape as estate_alert.py's. Value never printed.
+    while IFS= read -r line; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        case "$line" in ''|'#'*) continue ;; esac
+        case "$line" in "$1"=*)
+            v="${line#*=}"; v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+            printf '%s' "$v"; return 0 ;;
+        esac
+    done < "$ENV_FILE"
+    return 1
+}
+
+MAESTRO_TELEGRAM_TOKEN="$(read_key TELEGRAM_BOT_TOKEN || true)"
+MAESTRO_TELEGRAM_CHAT_ID="$(read_key TELEGRAM_HOME_CHANNEL || true)"
+export MAESTRO_TELEGRAM_TOKEN MAESTRO_TELEGRAM_CHAT_ID
+
+# Report which are present, never what they are.
+if [ -z "$MAESTRO_TELEGRAM_TOKEN" ] || [ -z "$MAESTRO_TELEGRAM_CHAT_ID" ]; then
+    echo "credentials incomplete in $ENV_FILE (token=$([ -n "$MAESTRO_TELEGRAM_TOKEN" ] && echo yes || echo no) chat=$([ -n "$MAESTRO_TELEGRAM_CHAT_ID" ] && echo yes || echo no))" >&2
+    exit 1
+fi
+
+exec "$PY" "$REPO/maestro.py" "$@"

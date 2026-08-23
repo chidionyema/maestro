@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# maestro-cert -- the acceptance probes REQUIREMENTS.jsonl calls.
+#
+# Each subcommand exits 0 when the claim it names is true and non-zero when it
+# is not. Nothing here prints a credential (LAW 21): the Telegram probes print
+# the API's ok flag and the message id, never the token or the chat id.
+#
+# It is a separate file from maestro.py on purpose. A claim must be checked from
+# outside the thing making it, or the check is the claim restating itself.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+ENV_FILE="${ESTATE_ENV:-$HOME/.config/estate/estate.env}"
+
+read_key() {
+    [ -f "$ENV_FILE" ] || return 1
+    while IFS= read -r line; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        case "$line" in ''|'#'*) continue ;; esac
+        case "$line" in "$1"=*)
+            v="${line#*=}"; v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+            printf '%s' "$v"; return 0 ;;
+        esac
+    done < "$ENV_FILE"
+    return 1
+}
+
+api() {  # api <method> <urlencoded-body>   -- never echoes the token
+    local tok; tok="$(read_key TELEGRAM_BOT_TOKEN)" || {
+        echo "no TELEGRAM_BOT_TOKEN in $ENV_FILE"; return 1; }
+    curl -s --max-time 15 -X POST \
+         "https://api.telegram.org/bot${tok}/$1" -d "$2"
+}
+
+case "${1:-}" in
+
+telegram-auth)
+    # Two angles: the bot identity resolves, and the chat it must reach resolves.
+    chat="$(read_key TELEGRAM_HOME_CHANNEL)" || { echo "no TELEGRAM_HOME_CHANNEL"; exit 1; }
+    me="$(api getMe '')"
+    ch="$(api getChat "chat_id=${chat}")"
+    echo "$me" | python3 -c 'import sys,json;d=json.load(sys.stdin);print("getMe   ok=%s username=%s"%(d.get("ok"),d.get("result",{}).get("username")));sys.exit(0 if d.get("ok") else 1)' || exit 1
+    echo "$ch" | python3 -c 'import sys,json;d=json.load(sys.stdin);print("getChat ok=%s type=%s"%(d.get("ok"),d.get("result",{}).get("type")));sys.exit(0 if d.get("ok") else 1)' || exit 1
+    ;;
+
+telegram-unsafe-markdown)
+    # The regression this exists for: text holding an unmatched _ or * made
+    # Telegram answer 400 can't parse entities, and the message was dropped
+    # silently. A delivered message returns a real message_id.
+    chat="$(read_key TELEGRAM_HOME_CHANNEL)" || { echo "no TELEGRAM_HOME_CHANNEL"; exit 1; }
+    body="maestro-cert MAE-021: unsafe_markdown_probe *unclosed _underscore"
+    out="$(api sendMessage "$(python3 -c '
+import urllib.parse,sys
+print(urllib.parse.urlencode({"chat_id":sys.argv[1],"text":sys.argv[2]}))' "$chat" "$body")")"
+    mid="$(echo "$out" | python3 -c '
+import sys,json
+d=json.load(sys.stdin)
+if d.get("ok"):
+    print(d["result"]["message_id"]); sys.exit(0)
+print("NOT delivered: %s" % d.get("description"), file=sys.stderr); sys.exit(1)')" || { echo "$out" | head -c 300; exit 1; }
+    echo "delivered message_id=$mid"
+    # Delete it again. A certification that runs hourly must not fill his chat
+    # with its own probes (LAW 20). The message_id above is the proof it landed.
+    api deleteMessage "chat_id=${chat}&message_id=${mid}" >/dev/null
+    ;;
+
+table-nonempty)
+    python3 - "$2" <<'PY'
+import os, sqlite3, sys
+table = sys.argv[1]
+path = os.path.expanduser(os.environ.get("MAESTRO_DB", "~/.maestro/experience_graph.db"))
+if not os.path.exists(path):
+    print(f"{table}: no database at {path}"); sys.exit(1)
+try:
+    n = sqlite3.connect(path).execute(f'select count(*) from "{table}"').fetchone()[0]
+except sqlite3.Error as e:
+    print(f"{table}: {e}"); sys.exit(1)
+print(f"{table}: {n} row(s)")
+sys.exit(0 if n > 0 else 1)
+PY
+    ;;
+
+*)
+    echo "usage: maestro-cert {telegram-auth|telegram-unsafe-markdown|table-nonempty <table>}" >&2
+    exit 2 ;;
+esac
