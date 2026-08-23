@@ -1957,6 +1957,13 @@ class Maestro:
                 suppressed,
             )
 
+        # A standing P0 makes every cycle SENSE -> CRISIS -> IDLE, so REPORT is
+        # never reached and anything that only fires there starves. Measured
+        # 2026-08-24 on the live loop: 5 standing estate-audit P0s had it
+        # orbiting crisis indefinitely. The weekly receipt must survive that —
+        # a week with a standing fire is exactly the week he needs the numbers.
+        self._maybe_send_learning_receipt()
+
         self.crisis_mode = False
         self.daily_findings = []
         self._save_intent()
