@@ -1213,8 +1213,16 @@ class EstateSensors:
                                 "severity": "P0",
                                 "lane": "estate",
                                 "description": f"{name} found in {hist_path}",
-                                "auto_fix": False,
-                                "skill": "credential_rotation",
+                                # Removing a leaked key from a history file is a
+                                # repair, not a rotation, and secret-scrub.py already
+                                # runs on every Stop hook estate wide, so letting
+                                # maestro run it adds no reach it did not have. It
+                                # redacts in place, never changes a line count, and
+                                # refuses the files whose job is to hold secrets.
+                                # Rotating the key at the provider is still a person's
+                                # decision and is not what this does.
+                                "auto_fix": True,
+                                "skill": "credential-leak-surface",
                                 "context": {"file": hist_path, "key_type": name}
                             })
             except Exception as e:
@@ -1512,6 +1520,16 @@ class Maestro:
         for finding in intent.decision.get("auto_fix", []):
             skill_id = finding.get("skill", "generic_fallback")
             skill = self.db.get_skill(skill_id)
+
+            if not skill:
+                # The sensor names its fix with a string written next to the check
+                # ("disk_cleanup"), while fixes are registered against the shape
+                # they repair. The two drifted, so check_disk asked for a skill id
+                # that has never existed. The graph is the source of truth about
+                # what handles an incident, so ask it before giving up.
+                skill = self.extractor.find_prevention(
+                    finding["description"], finding.get("lane", "estate")
+                )
 
             if not skill:
                 # There is no skill for this. Until today the code wrote one whose
