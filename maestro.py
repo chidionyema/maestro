@@ -337,6 +337,15 @@ class ExperienceGraph:
                     description TEXT,
                     lane TEXT
                 );
+
+                CREATE TABLE IF NOT EXISTS replay_incidents (
+                    fingerprint TEXT PRIMARY KEY,
+                    lane TEXT,
+                    trigger TEXT,
+                    times_paged INTEGER DEFAULT 1,
+                    first_seen TEXT,
+                    frozen_at TEXT
+                );
             """)
 
     def log_episode(self, episode: Episode) -> None:
@@ -382,6 +391,59 @@ class ExperienceGraph:
             if skill_id:
                 return str(skill_id)
         return None
+
+    # The frozen exam is bounded: the worst historic problem classes, by how
+    # often each paged a person. Small enough that one replay is a handful of
+    # indexed reads, large enough that a rising score is not noise.
+    REPLAY_SET_SIZE = 20
+
+    def freeze_replay_set(self) -> int:
+        """Seed the frozen replay set from every escalation ever recorded, once.
+
+        The set is frozen at first seeding and never reseeded, so a rising
+        replay score means the graph learned, not that the questions changed.
+        Returns the size of the set.
+        """
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT COUNT(*) FROM replay_incidents"
+            ).fetchone()[0]
+            if existing:
+                return existing
+            rows = conn.execute(
+                "SELECT lane, trigger, timestamp FROM episodes "
+                "WHERE action IN ('escalated', 'crisis_escalation') "
+                "ORDER BY timestamp"
+            ).fetchall()
+        classes: Dict[str, Dict] = {}
+        for lane, trigger, ts in rows:
+            fp = problem_fingerprint(trigger or "", lane or "")
+            entry = classes.setdefault(fp, {
+                "lane": lane or "estate", "trigger": trigger or "",
+                "first_seen": ts, "times_paged": 0,
+            })
+            entry["times_paged"] += 1
+        top = sorted(
+            classes.items(), key=lambda kv: kv[1]["times_paged"], reverse=True
+        )[: self.REPLAY_SET_SIZE]
+        frozen_at = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            for fp, c in top:
+                conn.execute(
+                    "INSERT OR IGNORE INTO replay_incidents "
+                    "(fingerprint, lane, trigger, times_paged, first_seen, frozen_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (fp, c["lane"], c["trigger"], c["times_paged"],
+                     c["first_seen"], frozen_at),
+                )
+        return len(top)
+
+    def replay_set(self) -> List[tuple]:
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT fingerprint, lane, trigger FROM replay_incidents "
+                "ORDER BY times_paged DESC"
+            ).fetchall()
 
     # A standing problem alerts again after this long, so suppression cannot
     # become silence. 24h, because the founder reads a daily rhythm, not a tick.
@@ -1885,13 +1947,53 @@ class Maestro:
                 paged_again.add(fp)
         fixed -= paged_again
         gone = len(prior_fps) - len(fixed) - len(paged_again)
+        replay = self._replay_frozen_incidents()
+        prev = self._last_replay_score()
+        trend = "first sitting" if prev is None else f"last receipt: {prev}"
         return (
             "📚 Learning receipt\n"
             f"Problem classes that paged you last week: {len(prior_fps)}.\n"
             f"Since then: {len(fixed)} fixed without you, "
             f"{len(paged_again)} paged you again, {gone} not seen.\n"
-            f"Fixes replayed from memory this week: {memory_fixes}."
+            f"Fixes replayed from memory this week: {memory_fixes}.\n"
+            f"Frozen replay: {replay['solved']} of {replay['total']} past "
+            f"incidents would now be fixed without you ({trend})."
         )
+
+    def _replay_frozen_incidents(self) -> Dict:
+        """Re-sit the frozen exam: which past pages would the graph fix today?
+
+        The set is the historic escalation classes, frozen at first run (the
+        founder's wealth of data, made a repeatable benchmark). This is a dry
+        run of the same consult _do_decide makes — remembered_fix against the
+        same lane rules — so it executes nothing and pages nobody. It answers
+        one question: of the problems that used to cost a person attention,
+        how many would now be fixed from memory?
+        """
+        self.db.freeze_replay_set()
+        solved = []
+        incidents = self.db.replay_set()
+        for fingerprint, lane, trigger in incidents:
+            lane_config = Config.LANES.get(lane, Config.LANES["estate"])
+            if not lane_config["auto_fix"]:
+                continue
+            if self.db.remembered_fix(trigger or "", lane or "estate"):
+                solved.append(fingerprint)
+        return {"solved": len(solved), "total": len(incidents),
+                "fingerprints": solved}
+
+    def _last_replay_score(self) -> Optional[int]:
+        with self.db._connect() as conn:
+            row = conn.execute(
+                "SELECT evidence FROM episodes WHERE action = 'replay' "
+                "ORDER BY timestamp DESC LIMIT 1"
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            return json.loads(row[0] or "{}").get("solved")
+        except json.JSONDecodeError:
+            return None
 
     def _maybe_send_learning_receipt(self) -> None:
         last = self.db.kv_get(self.LEARNING_RECEIPT_KEY)
@@ -1905,6 +2007,21 @@ class Maestro:
             self._learning_receipt_text(), Priority.P2, dedup_key="learning-receipt"
         ):
             self.db.kv_set(self.LEARNING_RECEIPT_KEY, datetime.utcnow().isoformat())
+            # The replay score is recorded only when its receipt was delivered,
+            # so the trend has exactly one point per week and a Telegram outage
+            # cannot write a run of identical rows (LAW 28: the loop closes at
+            # the reader, and LAW 30: a result worth knowing lands on disk).
+            replay = self._replay_frozen_incidents()
+            self.db.log_episode(Episode(
+                id=f"REPLAY-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-"
+                   f"{os.urandom(3).hex()}",
+                timestamp=datetime.utcnow().isoformat(),
+                lane="meta",
+                trigger="frozen replay set",
+                action="replay",
+                outcome="measured",
+                evidence=replay,
+            ))
 
     def _do_crisis(self):
         p0_findings = [f for f in self.daily_findings if f.get("severity") == "P0"]
