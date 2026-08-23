@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# LAW 32 for this repository: a feature ships with a demo and an onboarding.
+#
+# The machine's global core.hooksPath points every repo at ~/.estate/guards/hooks/_router,
+# which refuses a push from any repo that carries no pre-push of its own. This is maestro's.
+#
+# Install (one time, per clone):
+#     git config core.hooksPath .githooks
+# The global router finds this file without that, because it looks in .githooks first.
+#
+# What it refuses: a push containing a `feat:` commit that adds no docs/demo/<name>.md and
+# docs/onboarding/<name>.md, or whose pair is a heading with nothing under it. The floor is
+# 200 characters of prose per file once headings and blank lines are stripped, because a
+# gate satisfied by an empty template is a gate that teaches you to write empty templates.
+#
+# One-off escape: ALLOW_BRANCH_RECREATE=1 git push ...
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+refs="$(cat)"
+
+base="origin/main"
+if ! git rev-parse --verify --quiet "$base" >/dev/null; then
+  echo "pre-push: no $base to compare against; nothing to gate."
+  exit 0
+fi
+
+# The range is what this push adds on top of what origin/main already has. A commit already
+# merged is somebody else's problem and is not re-gated here.
+feats="$(git log --format='%s' "$base"..HEAD | grep -E '^feat(\(|:)' || true)"
+
+if [ -z "$feats" ]; then
+  exit 0
+fi
+
+missing=""
+while IFS= read -r subject; do
+  [ -n "$subject" ] || continue
+  # feat(name): thing   ->  name
+  # feat: thing         ->  first word of the description, lowercased and hyphenated
+  scope="$(printf '%s' "$subject" | sed -n 's/^feat(\([^)]*\)).*/\1/p')"
+  if [ -z "$scope" ]; then
+    scope="$(printf '%s' "$subject" | sed 's/^feat: *//' | awk '{print tolower($1)}')"
+  fi
+  for kind in demo onboarding; do
+    f="docs/$kind/$scope.md"
+    if [ ! -f "$f" ]; then
+      missing="$missing\n  $f is missing (from: $subject)"
+      continue
+    fi
+    prose="$(grep -v '^#' "$f" | grep -v '^\s*$' | tr -d '\n' | wc -c | tr -d ' ')"
+    if [ "$prose" -lt 200 ]; then
+      missing="$missing\n  $f has $prose characters of prose, the floor is 200"
+    fi
+  done
+done <<< "$feats"
+
+if [ -n "$missing" ]; then
+  echo "pre-push blocked by LAW 32: a feature ships with a demo and an onboarding."
+  printf "%b\n" "$missing"
+  echo ""
+  echo "  docs/demo/<name>.md        what he sees when it runs, real output, command above it"
+  echo "  docs/onboarding/<name>.md  what it is for, what it costs, where it lives, how to stop it"
+  echo ""
+  echo "Or, for a one-off:  ALLOW_BRANCH_RECREATE=1 git push ..."
+  [ "${ALLOW_BRANCH_RECREATE:-}" = "1" ] || exit 1
+fi
+
+printf '%s' "$refs" >/dev/null
+exit 0
