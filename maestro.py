@@ -16,6 +16,7 @@ Falsification conditions:
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -578,6 +579,11 @@ class ShapeExtractor:
     KNOWN_PATTERNS = {
         "resource-exhaustion-monotonic": {
             "triggers": ["disk full", "memory full", "connection pool exhausted", "GPU OOM"],
+            "signals": [
+                r"\b(disk|volume|memory|ram|swap|inode)\b.*\b(full|free|used|exhaust)",
+                r"\bno space left\b",
+                r"\b\d+(\.\d+)?%\s*used\b",
+            ],
             "mechanism": "monotonic growth of ephemeral artifact without cleanup",
             "contexts": ["disk", "memory", "network", "gpu"],
             "invariant": "LAW_RIPPLE",
@@ -602,9 +608,28 @@ class ShapeExtractor:
         },
         "credential-leak-surface": {
             "triggers": ["key in log", "token in history", "password in diff", "secret in env"],
+            "signals": [
+                r"\b(api[ _-]?key|live key|secret[ _-]?key|access[ _-]?key|token|password|passphrase|credential)\b"
+                # No leading \b on the surface words: the commonest surface on this
+                # machine is ".zsh_history", and "_" is a word character, so \bhistory
+                # never matches it. Measured: that one boundary hid 85 of 86 leaks.
+                r".{0,80}?(history|\.log\b|logfile|log file|diff|commit|env|environment|config|transcript|jsonl)",
+            ],
             "mechanism": "sensitive material written to durable surface without redaction",
             "contexts": ["shell-history", "git-log", "log-file", "env-var", "config-file"],
             "invariant": "LAW_TRADEOFF",
+        },
+        "service-unreachable-endpoint": {
+            "triggers": ["not responding", "connection refused", "unreachable"],
+            "signals": [
+                r"\bnot responding\b",
+                r"\bconnection refused\b",
+                r"\b(unreachable|no route to host)\b",
+                r"\b(dead|down|offline)\b.{0,30}\bport\b",
+            ],
+            "mechanism": "a process the estate depends on stopped listening and nothing restarted it",
+            "contexts": ["ollama", "gateway", "api", "daemon"],
+            "invariant": "LAW_MECHANISM",
         },
     }
 
@@ -619,9 +644,20 @@ class ShapeExtractor:
         return None
 
     def _matches_pattern(self, episode: Episode, pattern: Dict) -> bool:
-        trigger_lower = episode.trigger.lower()
-        action_lower = episode.action.lower()
-        return any(t in trigger_lower or t in action_lower for t in pattern["triggers"])
+        """Does this episode belong to this shape?
+
+        The trigger list is hand written English: "disk full", "token in history".
+        Real episodes are machine written: "Disk has 1.9 GiB free (99.6% used)",
+        "Stripe live key found in /Users/chidionyema/.zsh_history". Measured on the
+        121 episodes recorded up to 2026-08-23, substring matching against those
+        phrases found 0, while 105 of them are plainly two known shapes. So the
+        triggers stay as documentation of the pattern and `signals` does the work:
+        a regex per shape, written against the text the estate actually emits.
+        """
+        text = f"{episode.trigger} {episode.action}".lower()
+        if any(t in text for t in pattern["triggers"]):
+            return True
+        return any(re.search(s, text) for s in pattern.get("signals", ()))
 
     def _create_or_update_shape(self, pattern_id: str, pattern: Dict, episode: Episode) -> Shape:
         existing = self.graph.get_shapes(pattern_name=pattern_id)
