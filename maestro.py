@@ -719,6 +719,16 @@ class TelegramBridge:
     # far side. Telegram being down is not a reason to spend the tick budget on retries,
     # and it is not a reason to stop trying forever either.
     BREAKER_COOLDOWN_SECONDS = 300
+    # How long the same alert stays said. The state machine advances one state
+    # per 60s tick, so IDLE -> SENSE -> CRISIS is about three minutes: an estate
+    # holding eight standing criticals would send the founder the same crisis
+    # message twenty times an hour, forever, and the twentieth teaches him to
+    # stop reading the first. An alert is worth exactly one message until either
+    # the situation changes or this much time passes.
+    REPEAT_COOLDOWN_SECONDS = float(os.getenv("MAESTRO_REPEAT_COOLDOWN_S", str(6 * 3600)))
+    # On disk, because launchd restarts maestro on any exit (KeepAlive) and an
+    # in-memory fence would re-send everything on every restart.
+    FENCE_PATH = os.path.expanduser(os.getenv("MAESTRO_FENCE", "~/.maestro/alert_fence.json"))
 
     def __init__(self, token: str, chat_id: str, graph: ExperienceGraph):
         self.token = token
@@ -727,6 +737,46 @@ class TelegramBridge:
         self.enabled = bool(token and chat_id)
         self._consecutive_failures = 0
         self._circuit_opened_at = 0.0
+
+    def _load_fence(self) -> Dict[str, float]:
+        try:
+            with open(self.FENCE_PATH) as fh:
+                data = json.load(fh)
+            return {k: float(v) for k, v in data.items()} if isinstance(data, dict) else {}
+        except Exception:
+            # A missing or corrupt fence must never stop an alert. Failing open
+            # costs a duplicate message; failing closed loses the alert itself.
+            return {}
+
+    def _already_said(self, key: str) -> bool:
+        """True when this exact alert went out inside the cooldown.
+
+        The fence is written only on a successful send, so a message that was
+        dropped by the circuit breaker is not recorded as delivered and will be
+        tried again on the next tick.
+        """
+        fence = self._load_fence()
+        now = time.time()
+        last = fence.get(key)
+        if last is not None and now - last < self.REPEAT_COOLDOWN_SECONDS:
+            return True
+        return False
+
+    def _record_said(self, key: str) -> None:
+        fence = self._load_fence()
+        now = time.time()
+        fence[key] = now
+        # Drop entries older than two cooldowns so the file cannot grow forever.
+        cutoff = now - 2 * self.REPEAT_COOLDOWN_SECONDS
+        fence = {k: v for k, v in fence.items() if v >= cutoff}
+        try:
+            os.makedirs(os.path.dirname(self.FENCE_PATH), exist_ok=True)
+            tmp = self.FENCE_PATH + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(fence, fh)
+            os.replace(tmp, self.FENCE_PATH)
+        except Exception as e:
+            logger.error("Could not write the alert fence: %s", e)
 
     def _circuit_is_open(self) -> bool:
         """Open means: stop calling, the far side is not answering.
@@ -757,12 +807,25 @@ class TelegramBridge:
         self._consecutive_failures = 0
         self._circuit_opened_at = 0.0
 
-    def send(self, message: str, priority: Priority = Priority.P2) -> bool:
+    def send(self, message: str, priority: Priority = Priority.P2,
+             dedup_key: Optional[str] = None) -> bool:
+        """Send one message to the founder.
+
+        `dedup_key` names WHAT the message is about, so a digest whose episode
+        counters have ticked is still recognised as the same alert. Without one,
+        the message text is the key.
+        """
         if not self.enabled:
             logger.info(f"[TELEGRAM would send]: {message}")
             return True
         if priority == Priority.P3:
             return True
+
+        key = dedup_key or "text:" + hashlib.sha256(message.encode()).hexdigest()[:16]
+        if self._already_said(key):
+            logger.info("Already told him about %s inside the cooldown; not repeating", key)
+            return True
+
         if self._circuit_is_open():
             logger.warning("Telegram circuit open, dropping a %s message", priority.name)
             return False
@@ -797,6 +860,7 @@ class TelegramBridge:
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     if resp.status == 200:
                         self._record_success()
+                        self._record_said(key)
                         return True
                     last_error = f"HTTP {resp.status}"
             except urllib.error.HTTPError as e:
@@ -843,7 +907,12 @@ class TelegramBridge:
         if not needs_human and not incidents:
             lines.append("\n✅ All clear. Nothing needs you.")
 
-        return self.send("\n".join(lines), Priority.P2)
+        # Key on WHICH things need him, not on the rendered text: the stats line
+        # carries episode and spend counters that move every tick, so the text
+        # of an unchanged estate is never twice the same.
+        subject = ",".join(sorted(str(i.get("id", "?")) for i in needs_human))
+        key = "digest:" + hashlib.sha256(subject.encode()).hexdigest()[:16]
+        return self.send("\n".join(lines), Priority.P2, dedup_key=key)
 
     def poll_commands(self) -> List[Dict]:
         if not self.enabled:
@@ -875,20 +944,146 @@ class TelegramBridge:
 # ───────────────────────────────────────────────────────────────────────────────
 
 class EstateSensors:
+    # What the estate audit actually writes, and what this class used to expect.
+    #
+    # `estate_audit.py:474` emits {"generated_at": <epoch>, "counts": {...},
+    # "rows": [{domain, title, value, severity, proof, detail}]} with severities
+    # from `estate_audit.py:43` -- critical / warn / ok / unknown. This class
+    # asked for `data["findings"]` and P0..P3 and got neither, so every read
+    # returned an empty list. Measured 2026-08-23 20:07: a 24,311-byte file
+    # holding 57 rows and 8 criticals, read once a minute, producing 0 findings
+    # and the log line "All clear -- no digest sent (P3)". The estate had a
+    # billing incident and unrestorable backups that whole time.
+    #
+    # A key that does not exist is the worst kind of sensor fault: nothing
+    # raises, nothing logs, and silence is indistinguishable from health.
+    AUDIT_SEVERITY_TO_PRIORITY = {"critical": "P0", "warn": "P1", "unknown": "P2"}
+    # `ok` rows are the audit saying a check passed. They are not findings and
+    # are dropped rather than mapped, so a clean estate still reports clean.
+    AUDIT_SEVERITY_IGNORED = frozenset({"ok"})
+    # The audit runs on its own schedule. Past this, what it says is history,
+    # and reading history as current state is how a dead checker looks green.
+    AUDIT_STALE_AFTER_HOURS = float(os.getenv("MAESTRO_AUDIT_STALE_H", "6"))
+
     def __init__(self):
         self.audit_path = os.path.expanduser(Config.ESTATE_AUDIT_PATH)
+
+    def _sensor_fault(self, fault_id: str, description: str) -> Dict:
+        """A sensor that cannot see must say so, not report nothing.
+
+        These are P1: the estate may be perfectly healthy, but nobody can
+        currently tell, and that is a fact the founder needs rather than a
+        silence he will read as good news.
+        """
+        return {
+            "id": fault_id,
+            "severity": "P1",
+            "lane": "estate",
+            "description": description,
+            "auto_fix": False,
+            "skill": "estate_audit_repair",
+            "context": {"audit_path": self.audit_path},
+        }
 
     def read_audit(self) -> List[Dict]:
         if not os.path.exists(self.audit_path):
             logger.warning(f"Audit file not found: {self.audit_path}")
-            return []
+            return [self._sensor_fault(
+                "estate-audit-missing",
+                f"The estate audit maestro senses through is not there: {self.audit_path}",
+            )]
         try:
             with open(self.audit_path) as f:
                 data = json.load(f)
-                return data.get("findings", [])
         except Exception as e:
             logger.error(f"Failed to read audit: {e}")
-            return []
+            return [self._sensor_fault(
+                "estate-audit-unreadable",
+                f"The estate audit cannot be read: {e}",
+            )]
+
+        findings: List[Dict] = []
+
+        age_h = (time.time() - os.path.getmtime(self.audit_path)) / 3600
+        generated_at = data.get("generated_at")
+        if isinstance(generated_at, (int, float)):
+            age_h = (time.time() - generated_at) / 3600
+        if age_h > self.AUDIT_STALE_AFTER_HOURS:
+            findings.append(self._sensor_fault(
+                "estate-audit-stale",
+                f"The estate audit last ran {age_h:.1f}h ago; "
+                f"everything below it is that old",
+            ))
+
+        # `rows` is what the audit writes today. `findings` is accepted too, so a
+        # writer that already speaks this class's own shape keeps working.
+        rows = data.get("rows")
+        if rows is None:
+            rows = data.get("findings")
+        if rows is None:
+            logger.error(
+                "The audit at %s has neither 'rows' nor 'findings' (keys: %s)",
+                self.audit_path, sorted(data)[:10],
+            )
+            return findings + [self._sensor_fault(
+                "estate-audit-schema-unknown",
+                f"The estate audit has no rows this reader understands "
+                f"(keys: {', '.join(sorted(data)[:10])})",
+            )]
+
+        unmapped = set()
+        for row in rows:
+            severity = str(row.get("severity", "")).lower()
+            if severity in self.AUDIT_SEVERITY_IGNORED:
+                continue
+            # Already in this class's vocabulary: pass it through untouched.
+            if severity.upper() in ("P0", "P1", "P2", "P3"):
+                findings.append(row)
+                continue
+            priority = self.AUDIT_SEVERITY_TO_PRIORITY.get(severity)
+            if priority is None:
+                # Never drop a row because its severity is a word nobody taught
+                # this map. An unknown severity is treated as a real finding at
+                # P1 and the word is reported, because a silent skip here is the
+                # exact defect this whole function is a fix for.
+                unmapped.add(severity or "(blank)")
+                priority = "P1"
+
+            domain = row.get("domain", "estate")
+            title = row.get("title", "untitled check")
+            value = row.get("value", "")
+            findings.append({
+                "id": "estate-audit-" + hashlib.sha256(
+                    f"{domain}|{title}".encode()
+                ).hexdigest()[:12],
+                "severity": priority,
+                "lane": "estate",
+                "description": f"[{domain}] {title}: {value}",
+                # An audit row describes a state, not a repair. Nothing here has
+                # a verified skill behind it, and _do_act invents an `echo` skill
+                # for anything marked auto-fixable and then records it as
+                # resolved -- a fix that never happened, reported as one.
+                "auto_fix": False,
+                "skill": "estate_audit_followup",
+                "context": {
+                    "domain": domain,
+                    "title": title,
+                    "value": value,
+                    "proof": row.get("proof", ""),
+                    "detail": row.get("detail", ""),
+                },
+            })
+
+        if unmapped:
+            logger.warning(
+                "Audit severities this reader does not know, raised as P1: %s",
+                ", ".join(sorted(unmapped)),
+            )
+        logger.info(
+            "Estate audit: %d row(s) read, %d finding(s) after dropping %s",
+            len(rows), len(findings), "/".join(sorted(self.AUDIT_SEVERITY_IGNORED)),
+        )
+        return findings
 
     def check_bridges(self) -> List[Dict]:
         findings = []
@@ -1379,12 +1574,14 @@ class Maestro:
 
     def _do_crisis(self):
         p0_findings = [f for f in self.daily_findings if f.get("severity") == "P0"]
+        subject = ",".join(sorted(str(f.get("id", "?")) for f in p0_findings))
         self.bridge.send(
             f"🚨 *CRISIS MODE*\n\n"
             f"{len(p0_findings)} P0 finding(s):\n" +
             "\n".join(f"• {f['description']}" for f in p0_findings) +
             "\n\nAll non-essential lanes frozen. Manual intervention required.",
-            Priority.P0
+            Priority.P0,
+            dedup_key="crisis:" + hashlib.sha256(subject.encode()).hexdigest()[:16],
         )
 
         for finding in p0_findings:
