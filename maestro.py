@@ -696,22 +696,49 @@ class TelegramBridge:
 
         import urllib.request
         import urllib.parse
+        import urllib.error
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-        data = urllib.parse.urlencode({
-            "chat_id": self.chat_id,
-            "text": message,
-            "parse_mode": "Markdown"
-        }).encode()
+
+        # Every message this class sends interpolates a finding's description
+        # into a Markdown template ("*Estate Digest*", "• {description}"). A
+        # description holding an underscore or a lone asterisk -- a file path, a
+        # config key, a shell glob -- makes Telegram reject the whole body with
+        # 400 "can't parse entities", and the retry loop then sent the same
+        # unparseable bytes twice more before opening the circuit breaker.
+        # Measured 2026-08-23: three failures, one dropped P2, and the finding
+        # it was carrying (a HuggingFace token in ~/.claude/history.jsonl) was
+        # lost. Formatting is worth trying and never worth losing a message
+        # over, so a parse rejection drops parse_mode and sends it as text.
+        plain = False
+
+        def body() -> bytes:
+            fields = {"chat_id": self.chat_id, "text": message}
+            if not plain:
+                fields["parse_mode"] = "Markdown"
+            return urllib.parse.urlencode(fields).encode()
 
         last_error = None
         for attempt in range(self.SEND_TRIES):
             try:
-                req = urllib.request.Request(url, data=data, method="POST")
+                req = urllib.request.Request(url, data=body(), method="POST")
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     if resp.status == 200:
                         self._record_success()
                         return True
                     last_error = f"HTTP {resp.status}"
+            except urllib.error.HTTPError as e:
+                # Telegram puts the real reason in the body. "HTTP Error 400:
+                # Bad Request" on its own names nothing and cost an afternoon.
+                try:
+                    detail = json.loads(e.read()).get("description", "")
+                except Exception:
+                    detail = ""
+                last_error = f"HTTP {e.code}: {detail or e.reason}"
+                if e.code == 400 and not plain:
+                    plain = True
+                    logger.warning("Telegram rejected the Markdown (%s); "
+                                   "resending as plain text", detail or "no detail")
+                    continue          # retry now, do not spend a backoff on it
             except Exception as e:
                 last_error = str(e)
             if attempt < self.SEND_TRIES - 1:
