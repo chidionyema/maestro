@@ -5,7 +5,8 @@
     "api.telegram.org": {"covered_by": "telegram-delivery"}
   },
   "credentials": {
-    "GITHUB_TOKEN":   {"covered_by": "github-gone"},
+    "GITHUB_TOKEN":   {"covered_by": "estate-bundle-restore"},
+    "GH_TOKEN":       {"covered_by": "estate-bundle-restore"},
     "TELEGRAM_TOKEN": {"covered_by": "telegram-delivery"}
   }
 }
