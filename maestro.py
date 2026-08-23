@@ -202,6 +202,20 @@ class Intent:
 # EXPERIENCE GRAPH (SQLite)
 # ───────────────────────────────────────────────────────────────────────────────
 
+def problem_fingerprint(description: str, lane: str = "") -> str:
+    """One id for one class of problem, stable across its varying numbers.
+
+    "Disk at 96%" today and "Disk at 97%" tomorrow are the same problem twice,
+    and treating them as two is exactly how the graph escalated one Stripe
+    finding 46 times without ever learning. Lowercase, collapse every digit run
+    to '#', collapse whitespace, hash. The lane is part of the class: the same
+    words in two lanes are two different problems with two different fixes.
+    """
+    text = re.sub(r"\d+", "#", description.lower())
+    text = re.sub(r"\s+", " ", text).strip()
+    return hashlib.sha256(f"{lane}|{text}".encode()).hexdigest()[:16]
+
+
 class ExperienceGraph:
     def __init__(self, db_path: str):
         self.db_path = os.path.expanduser(db_path)
@@ -337,6 +351,37 @@ class ExperienceGraph:
                 episode.action, episode.outcome, json.dumps(episode.evidence),
                 episode.duration_ms, episode.cost_usd, episode.shape_id
             ))
+
+    # How many recent success episodes one memory consult scans. Bounded so a
+    # years-old ledger cannot turn every decide pass into a table scan.
+    MEMORY_SCAN_LIMIT = 500
+
+    def remembered_fix(self, description: str, lane: str) -> Optional[str]:
+        """The skill that last fixed this class of problem, or None.
+
+        Consult-before-escalate: a problem this graph has already watched a
+        skill fix is retried from that memory before a person is paged. Only a
+        success episode that recorded WHICH skill ran can teach — an older
+        success with no skill_id in its evidence is history, not memory.
+        """
+        target = problem_fingerprint(description, lane)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT trigger, evidence FROM episodes "
+                "WHERE lane = ? AND action = 'auto_fix' AND outcome = 'success' "
+                "ORDER BY timestamp DESC LIMIT ?",
+                (lane, self.MEMORY_SCAN_LIMIT),
+            ).fetchall()
+        for trigger, evidence in rows:
+            if problem_fingerprint(trigger or "", lane) != target:
+                continue
+            try:
+                skill_id = json.loads(evidence or "{}").get("skill_id")
+            except json.JSONDecodeError:
+                continue
+            if skill_id:
+                return str(skill_id)
+        return None
 
     # A standing problem alerts again after this long, so suppression cannot
     # become silence. 24h, because the founder reads a daily rhythm, not a tick.
@@ -1592,7 +1637,17 @@ class Maestro:
                 "baseline": "previous_state_normal",
                 "tradeoffs": [{"cost": "time", "probability": 0.3, "impact": "delay"}],
                 "ripple_effects": [{"effect": "service_restart", "then": {"effect": "brief_downtime"}}],
-                "mechanism": finding.get("skill", "unknown") + " execution with verification",
+                # Two real steps, because that is what _do_act and _do_verify do.
+                # The old one-liner ("<skill> execution with verification") failed
+                # _law_mechanism's two-step floor on EVERY plan, so every finding
+                # since the gate existed was escalated as a LAW_MECHANISM
+                # violation and the auto_fix and queue branches below were dead
+                # code. Measured 2026-08-24 across all 183 live intents: the only
+                # 2 findings that ever reached this method were both rejected here.
+                "mechanism": (
+                    f"run skill {finding.get('skill', 'unknown')} against the finding's context\n"
+                    "re-sense the lane and confirm the finding is gone before reporting"
+                ),
                 "sources": [{"source": "estate_audit", "retrieval_date": datetime.utcnow().isoformat(), "confidence": 0.9}]
             }
 
@@ -1613,8 +1668,23 @@ class Maestro:
                 finding["route"] = "auto_fix"
                 intent.decision["auto_fix"].append(finding)
             else:
-                finding["route"] = "queue"
-                intent.decision["queue"].append(finding)
+                # Before this finding costs a person attention, ask the graph
+                # whether it has watched a skill fix this exact class before.
+                # A remembered fix is retried; only a problem the graph has
+                # never solved goes to the queue. P0 stays above this branch on
+                # purpose — a crisis pages first and learns second.
+                remembered = (
+                    self.db.remembered_fix(finding.get("description", ""), lane)
+                    if lane_config["auto_fix"] else None
+                )
+                if remembered:
+                    finding["skill"] = remembered
+                    finding["route"] = "auto_fix"
+                    finding.setdefault("context", {})["source"] = "memory"
+                    intent.decision["auto_fix"].append(finding)
+                else:
+                    finding["route"] = "queue"
+                    intent.decision["queue"].append(finding)
 
         self._transition(State.ACT)
 
@@ -1666,6 +1736,10 @@ class Maestro:
             })
 
             if success:
+                # The success episode's evidence must name the skill that ran,
+                # or remembered_fix can never learn from this repair and the
+                # next occurrence pages a person for a problem already solved.
+                finding.setdefault("context", {})["skill_id"] = skill.id
                 self.daily_resolved.append(finding)
             else:
                 finding["route"] = "escalate"
@@ -1758,11 +1832,79 @@ class Maestro:
                 suppressed,
             )
 
+        self._maybe_send_learning_receipt()
+
         self.daily_findings = []
         self.daily_resolved = []
         self.daily_needs_human = []
         self._save_intent()
         self._transition(State.IDLE)
+
+    # The receipt is weekly. It lives in the kv table, not in a scheduler,
+    # so it needs no plist and survives restarts.
+    LEARNING_RECEIPT_KEY = "last_learning_receipt"
+    LEARNING_RECEIPT_DAYS = 7
+
+    def _learning_receipt_text(self) -> str:
+        """One paragraph proving whether last week's pages got cheaper.
+
+        For every problem class that paged the founder in the week before last
+        week, say what happened to it since: fixed without him, paged him
+        again, or not seen. A class that did both in one week is counted as
+        paging him again, because "learned" is the stronger claim and it loses
+        ties. An all-zero week is reported as itself, not skipped — silence is
+        also what a dead checker sounds like.
+        """
+        now = datetime.utcnow()
+        week = timedelta(days=self.LEARNING_RECEIPT_DAYS)
+        with self.db._connect() as conn:
+            prior = conn.execute(
+                "SELECT trigger, lane FROM episodes "
+                "WHERE action IN ('escalated', 'crisis_escalation') "
+                "AND timestamp >= ? AND timestamp < ?",
+                ((now - 2 * week).isoformat(), (now - week).isoformat()),
+            ).fetchall()
+            current = conn.execute(
+                "SELECT trigger, lane, action, outcome, evidence FROM episodes "
+                "WHERE timestamp >= ?",
+                ((now - week).isoformat(),),
+            ).fetchall()
+        prior_fps = {problem_fingerprint(t or "", l or "") for t, l in prior}
+        fixed, paged_again, memory_fixes = set(), set(), 0
+        for trigger, lane, action, outcome, evidence in current:
+            fp = problem_fingerprint(trigger or "", lane or "")
+            if action == "auto_fix" and outcome == "success":
+                if fp in prior_fps:
+                    fixed.add(fp)
+                try:
+                    if json.loads(evidence or "{}").get("source") == "memory":
+                        memory_fixes += 1
+                except json.JSONDecodeError:
+                    pass
+            elif action in ("escalated", "crisis_escalation") and fp in prior_fps:
+                paged_again.add(fp)
+        fixed -= paged_again
+        gone = len(prior_fps) - len(fixed) - len(paged_again)
+        return (
+            "📚 Learning receipt\n"
+            f"Problem classes that paged you last week: {len(prior_fps)}.\n"
+            f"Since then: {len(fixed)} fixed without you, "
+            f"{len(paged_again)} paged you again, {gone} not seen.\n"
+            f"Fixes replayed from memory this week: {memory_fixes}."
+        )
+
+    def _maybe_send_learning_receipt(self) -> None:
+        last = self.db.kv_get(self.LEARNING_RECEIPT_KEY)
+        if last and datetime.utcnow() - datetime.fromisoformat(last) < timedelta(
+            days=self.LEARNING_RECEIPT_DAYS
+        ):
+            return
+        # kv advances only on a delivered send: a dropped receipt is retried
+        # next pass, not marked done. The loop closes at the reader.
+        if self.bridge.send(
+            self._learning_receipt_text(), Priority.P2, dedup_key="learning-receipt"
+        ):
+            self.db.kv_set(self.LEARNING_RECEIPT_KEY, datetime.utcnow().isoformat())
 
     def _do_crisis(self):
         p0_findings = [f for f in self.daily_findings if f.get("severity") == "P0"]
@@ -1878,7 +2020,17 @@ if __name__ == "__main__":
     parser.add_argument("--once", action="store_true", help="Run one tick and exit")
     parser.add_argument("--status", action="store_true", help="Print status and exit")
     parser.add_argument("--init", action="store_true", help="Initialize database and exit")
+    parser.add_argument("--learning-receipt", action="store_true",
+                        help="Print and send the weekly learning receipt now, then exit")
     args = parser.parse_args()
+
+    if args.learning_receipt:
+        m = Maestro()
+        text = m._learning_receipt_text()
+        print(text)
+        ok = m.bridge.send(text, Priority.P2, dedup_key="learning-receipt")
+        print(f"delivered: {ok}")
+        sys.exit(0 if ok else 1)
 
     if args.init:
         db = ExperienceGraph(Config.DB_PATH)
