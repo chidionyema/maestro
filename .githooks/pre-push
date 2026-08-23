@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# LAW 32 for this repository, delegated to the one implementation of it.
+#
+# This file existed as a full copy of the gate for about twenty minutes on 2026-08-23, written
+# when the global router refused any repository that carried no pre-push. The router now runs
+# the shared gate itself, so a second copy here would only drift from it. The file stays because
+# the router looks in .githooks first and a repository may one day want to add checks of its own
+# above the shared ones.
+set -euo pipefail
+exec "$HOME/.estate/guards/hooks/law32-default" "$@"

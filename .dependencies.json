@@ -1,0 +1,12 @@
+{
+  "_": "Every host and credential in this repository is either covered by a drill on the estate register or dismissed with a reason. drills/audit.py --ci enforces it on every pull request.",
+  "scan": {"exclude": []},
+  "hosts": {
+    "api.telegram.org": {"covered_by": "telegram-delivery"}
+  },
+  "credentials": {
+    "GITHUB_TOKEN":   {"covered_by": "estate-bundle-restore"},
+    "GH_TOKEN":       {"covered_by": "estate-bundle-restore"},
+    "TELEGRAM_TOKEN": {"covered_by": "telegram-delivery"}
+  }
+}

@@ -16,6 +16,7 @@ Falsification conditions:
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -35,6 +36,39 @@ from pathlib import Path
 # CONFIGURATION
 # ───────────────────────────────────────────────────────────────────────────────
 
+def _borrow_from_architect(key: str) -> str:
+    """Read one value out of The Architect's .env so maestro can reach the founder.
+
+    maestro's launchd plist carries no Telegram credentials, so until 2026-08-23
+    TelegramBridge fell through to its `[TELEGRAM would send]` branch: every
+    escalation it ever raised would have gone to a log file instead of his phone,
+    and a healthy maestro and a mute one produced identical silence.
+
+    Minting a second bot for maestro would cost the founder a trip to BotFather,
+    and a second credential to rotate. The Architect already holds a working bot,
+    and maestro only ever calls sendMessage — never getUpdates — so borrowing the
+    token adds no second poller and cannot make the gateway go deaf.
+
+    The value is read at import from a 600-mode file and never logged or written
+    anywhere else. Returns '' when the file is unreadable, which leaves the
+    existing rehearsal behaviour exactly as it was.
+    """
+    env_path = Path(
+        os.getenv("ARCHITECT_HOME", "~/dev/code/hermes-v2")
+    ).expanduser() / ".env"
+    try:
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, _, value = line.partition("=")
+            if name.strip() == key:
+                return value.strip().strip("'\"")
+    except OSError:
+        return ""
+    return ""
+
+
 class Config:
     """Centralized, environment-overridable configuration."""
     DB_PATH = os.getenv("MAESTRO_DB", "~/.maestro/experience_graph.db")
@@ -50,8 +84,12 @@ class Config:
         "meta": {"auto_fix": False, "escalate_after_attempts": 0, "budget_usd": 5.0},
     }
 
-    TELEGRAM_TOKEN = os.getenv("MAESTRO_TELEGRAM_TOKEN", "")
-    TELEGRAM_CHAT_ID = os.getenv("MAESTRO_TELEGRAM_CHAT_ID", "")
+    TELEGRAM_TOKEN = os.getenv("MAESTRO_TELEGRAM_TOKEN", "") or _borrow_from_architect(
+        "TELEGRAM_BOT_TOKEN"
+    )
+    TELEGRAM_CHAT_ID = os.getenv(
+        "MAESTRO_TELEGRAM_CHAT_ID", ""
+    ) or _borrow_from_architect("TELEGRAM_HOME_CHANNEL")
     GITHUB_TOKEN = os.getenv("MAESTRO_GITHUB_TOKEN", "")
     GITHUB_REPO = os.getenv("MAESTRO_GITHUB_REPO", "")
     DEFAULT_LOCAL_MODEL = os.getenv("MAESTRO_LOCAL_MODEL", "qwen2.5:7b")
@@ -275,6 +313,16 @@ class ExperienceGraph:
                     date TEXT PRIMARY KEY,
                     amount_usd REAL DEFAULT 0.0
                 );
+
+                CREATE TABLE IF NOT EXISTS open_alarms (
+                    finding_id TEXT PRIMARY KEY,
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL,
+                    last_alerted TEXT NOT NULL,
+                    times_seen INTEGER DEFAULT 1,
+                    description TEXT,
+                    lane TEXT
+                );
             """)
 
     def log_episode(self, episode: Episode) -> None:
@@ -289,6 +337,73 @@ class ExperienceGraph:
                 episode.action, episode.outcome, json.dumps(episode.evidence),
                 episode.duration_ms, episode.cost_usd, episode.shape_id
             ))
+
+    # A standing problem alerts again after this long, so suppression cannot
+    # become silence. 24h, because the founder reads a daily rhythm, not a tick.
+    ALARM_REALERT_SECONDS = 24 * 3600
+
+    def alarm_disposition(self, finding_id: str, description: str = "",
+                          lane: str = "estate") -> str:
+        """One open alarm per live problem, so a problem pages once, not once per tick.
+
+        Returns "new" on first sighting, "realert" when the interval has lapsed
+        with the problem still standing, "suppressed" otherwise. Every call
+        updates last_seen and the sighting count, so the eventual cleared episode
+        can say how long it stood and how many times it was seen.
+        """
+        now = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT last_alerted FROM open_alarms WHERE finding_id = ?",
+                (finding_id,),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO open_alarms "
+                    "(finding_id, first_seen, last_seen, last_alerted, times_seen, description, lane) "
+                    "VALUES (?, ?, ?, ?, 1, ?, ?)",
+                    (finding_id, now, now, now, description, lane),
+                )
+                return "new"
+            lapsed = (datetime.utcnow() - datetime.fromisoformat(row[0])).total_seconds()
+            if lapsed >= self.ALARM_REALERT_SECONDS:
+                conn.execute(
+                    "UPDATE open_alarms SET last_seen = ?, last_alerted = ?, "
+                    "times_seen = times_seen + 1 WHERE finding_id = ?",
+                    (now, now, finding_id),
+                )
+                return "realert"
+            conn.execute(
+                "UPDATE open_alarms SET last_seen = ?, times_seen = times_seen + 1 "
+                "WHERE finding_id = ?",
+                (now, finding_id),
+            )
+            return "suppressed"
+
+    def close_cleared_alarms(self, active_ids) -> List[Dict[str, Any]]:
+        """Close every open alarm whose problem this sense pass did not find.
+
+        Returns the closed rows so the caller can say the problem ended. An
+        alarm that opens loudly and closes silently teaches that silence means
+        nothing, which is how channels get muted.
+        """
+        active = set(active_ids)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT finding_id, first_seen, last_seen, times_seen, description, lane "
+                "FROM open_alarms"
+            ).fetchall()
+            closed = [
+                {"finding_id": r[0], "first_seen": r[1], "last_seen": r[2],
+                 "times_seen": r[3], "description": r[4], "lane": r[5]}
+                for r in rows if r[0] not in active
+            ]
+            for alarm in closed:
+                conn.execute(
+                    "DELETE FROM open_alarms WHERE finding_id = ?",
+                    (alarm["finding_id"],),
+                )
+        return closed
 
     def get_shapes(self, pattern_name: Optional[str] = None) -> List[Shape]:
         with self._connect() as conn:
@@ -541,6 +656,11 @@ class ShapeExtractor:
     KNOWN_PATTERNS = {
         "resource-exhaustion-monotonic": {
             "triggers": ["disk full", "memory full", "connection pool exhausted", "GPU OOM"],
+            "signals": [
+                r"\b(disk|volume|memory|ram|swap|inode)\b.*\b(full|free|used|exhaust)",
+                r"\bno space left\b",
+                r"\b\d+(\.\d+)?%\s*used\b",
+            ],
             "mechanism": "monotonic growth of ephemeral artifact without cleanup",
             "contexts": ["disk", "memory", "network", "gpu"],
             "invariant": "LAW_RIPPLE",
@@ -565,9 +685,28 @@ class ShapeExtractor:
         },
         "credential-leak-surface": {
             "triggers": ["key in log", "token in history", "password in diff", "secret in env"],
+            "signals": [
+                r"\b(api[ _-]?key|live key|secret[ _-]?key|access[ _-]?key|token|password|passphrase|credential)\b"
+                # No leading \b on the surface words: the commonest surface on this
+                # machine is ".zsh_history", and "_" is a word character, so \bhistory
+                # never matches it. Measured: that one boundary hid 85 of 86 leaks.
+                r".{0,80}?(history|\.log\b|logfile|log file|diff|commit|env|environment|config|transcript|jsonl)",
+            ],
             "mechanism": "sensitive material written to durable surface without redaction",
             "contexts": ["shell-history", "git-log", "log-file", "env-var", "config-file"],
             "invariant": "LAW_TRADEOFF",
+        },
+        "service-unreachable-endpoint": {
+            "triggers": ["not responding", "connection refused", "unreachable"],
+            "signals": [
+                r"\bnot responding\b",
+                r"\bconnection refused\b",
+                r"\b(unreachable|no route to host)\b",
+                r"\b(dead|down|offline)\b.{0,30}\bport\b",
+            ],
+            "mechanism": "a process the estate depends on stopped listening and nothing restarted it",
+            "contexts": ["ollama", "gateway", "api", "daemon"],
+            "invariant": "LAW_MECHANISM",
         },
     }
 
@@ -575,16 +714,45 @@ class ShapeExtractor:
         self.graph = graph
 
     def extract(self, episode: Episode) -> Optional[Shape]:
-        for pattern_id, pattern in self.KNOWN_PATTERNS.items():
-            if self._matches_pattern(episode, pattern):
-                return self._create_or_update_shape(pattern_id, pattern, episode)
+        pattern_id = self.pattern_for(f"{episode.trigger} {episode.action}")
+        if pattern_id:
+            return self._create_or_update_shape(
+                pattern_id, self.KNOWN_PATTERNS[pattern_id], episode
+            )
         logger.info(f"Novel incident logged: {episode.id}")
         return None
 
+    def pattern_for(self, text: str) -> Optional[str]:
+        """Which shape does this text belong to, if any.
+
+        One matcher, used by both callers. `extract` classifies an incident on the
+        way in and `find_prevention` classifies it again on the way out, and until
+        today they matched differently: find_prevention compared against
+        `morphology["trigger_keywords"]`, which holds the hand written English
+        phrases, so it answered None for text that `extract` had just classified.
+        """
+        probe = Episode(id="", timestamp="", lane="", trigger=text,
+                        action="", outcome="")
+        for pattern_id, pattern in self.KNOWN_PATTERNS.items():
+            if self._matches_pattern(probe, pattern):
+                return pattern_id
+        return None
+
     def _matches_pattern(self, episode: Episode, pattern: Dict) -> bool:
-        trigger_lower = episode.trigger.lower()
-        action_lower = episode.action.lower()
-        return any(t in trigger_lower or t in action_lower for t in pattern["triggers"])
+        """Does this episode belong to this shape?
+
+        The trigger list is hand written English: "disk full", "token in history".
+        Real episodes are machine written: "Disk has 1.9 GiB free (99.6% used)",
+        "Stripe live key found in /Users/chidionyema/.zsh_history". Measured on the
+        121 episodes recorded up to 2026-08-23, substring matching against those
+        phrases found 0, while 105 of them are plainly two known shapes. So the
+        triggers stay as documentation of the pattern and `signals` does the work:
+        a regex per shape, written against the text the estate actually emits.
+        """
+        text = f"{episode.trigger} {episode.action}".lower()
+        if any(t in text for t in pattern["triggers"]):
+            return True
+        return any(re.search(s, text) for s in pattern.get("signals", ()))
 
     def _create_or_update_shape(self, pattern_id: str, pattern: Dict, episode: Episode) -> Shape:
         existing = self.graph.get_shapes(pattern_name=pattern_id)
@@ -608,7 +776,7 @@ class ShapeExtractor:
                 },
                 contexts_observed=[episode.lane],
                 invariant_violated=pattern["invariant"],
-                prevention_skill=f"skills/{pattern_id}.py",
+                prevention_skill=pattern_id,
                 first_seen=episode.timestamp,
                 last_seen=episode.timestamp,
                 occurrence_count=1,
@@ -620,15 +788,36 @@ class ShapeExtractor:
         return shape
 
     def find_prevention(self, trigger: str, lane: str) -> Optional[Skill]:
-        shapes = self.graph.get_shape_by_context(lane)
+        """The skill that handles this incident, or None to send it to a person.
+
+        The old gate asked for `shape.prevention_success_rate > 0.5`. A shape is
+        born at 0.0 and that number only moves when its skill runs, so no shape
+        could ever hand over its skill and no skill could ever earn a rate. The
+        loop the whole design rests on could not turn once. The gate belongs on
+        the skill instead: a skill that has never run is allowed exactly the run
+        that gives it a record, and one that has run and mostly failed is not.
+        """
+        pattern_id = self.pattern_for(trigger)
+        if not pattern_id:
+            return None
+        shapes = self.graph.get_shapes(pattern_name=pattern_id)
         for shape in shapes:
-            if shape.prevention_success_rate > 0.5 and shape.confidence > 0.5:
-                triggers = shape.morphology.get("trigger_keywords", [])
-                if any(t in trigger.lower() for t in triggers):
-                    skill = self.graph.get_skill(shape.prevention_skill)
-                    if skill:
-                        return skill
+            if shape.confidence <= 0.5:
+                continue
+            skill = self.graph.get_skill(self._skill_id(shape))
+            if not skill:
+                continue
+            if skill.total_uses == 0 or skill.success_rate > 0.5:
+                return skill
         return None
+
+    @staticmethod
+    def _skill_id(shape: Shape) -> str:
+        """Shapes recorded before 2026-08-23 hold a path, "skills/<name>.py", while
+        the skills table is keyed by bare name, so every lookup missed. New shapes
+        store the bare name; this reads both."""
+        ref = shape.prevention_skill or shape.pattern_name
+        return os.path.basename(ref).removesuffix(".py")
 
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -646,6 +835,16 @@ class TelegramBridge:
     # far side. Telegram being down is not a reason to spend the tick budget on retries,
     # and it is not a reason to stop trying forever either.
     BREAKER_COOLDOWN_SECONDS = 300
+    # How long the same alert stays said. The state machine advances one state
+    # per 60s tick, so IDLE -> SENSE -> CRISIS is about three minutes: an estate
+    # holding eight standing criticals would send the founder the same crisis
+    # message twenty times an hour, forever, and the twentieth teaches him to
+    # stop reading the first. An alert is worth exactly one message until either
+    # the situation changes or this much time passes.
+    REPEAT_COOLDOWN_SECONDS = float(os.getenv("MAESTRO_REPEAT_COOLDOWN_S", str(6 * 3600)))
+    # On disk, because launchd restarts maestro on any exit (KeepAlive) and an
+    # in-memory fence would re-send everything on every restart.
+    FENCE_PATH = os.path.expanduser(os.getenv("MAESTRO_FENCE", "~/.maestro/alert_fence.json"))
 
     def __init__(self, token: str, chat_id: str, graph: ExperienceGraph):
         self.token = token
@@ -654,6 +853,46 @@ class TelegramBridge:
         self.enabled = bool(token and chat_id)
         self._consecutive_failures = 0
         self._circuit_opened_at = 0.0
+
+    def _load_fence(self) -> Dict[str, float]:
+        try:
+            with open(self.FENCE_PATH) as fh:
+                data = json.load(fh)
+            return {k: float(v) for k, v in data.items()} if isinstance(data, dict) else {}
+        except Exception:
+            # A missing or corrupt fence must never stop an alert. Failing open
+            # costs a duplicate message; failing closed loses the alert itself.
+            return {}
+
+    def _already_said(self, key: str) -> bool:
+        """True when this exact alert went out inside the cooldown.
+
+        The fence is written only on a successful send, so a message that was
+        dropped by the circuit breaker is not recorded as delivered and will be
+        tried again on the next tick.
+        """
+        fence = self._load_fence()
+        now = time.time()
+        last = fence.get(key)
+        if last is not None and now - last < self.REPEAT_COOLDOWN_SECONDS:
+            return True
+        return False
+
+    def _record_said(self, key: str) -> None:
+        fence = self._load_fence()
+        now = time.time()
+        fence[key] = now
+        # Drop entries older than two cooldowns so the file cannot grow forever.
+        cutoff = now - 2 * self.REPEAT_COOLDOWN_SECONDS
+        fence = {k: v for k, v in fence.items() if v >= cutoff}
+        try:
+            os.makedirs(os.path.dirname(self.FENCE_PATH), exist_ok=True)
+            tmp = self.FENCE_PATH + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(fence, fh)
+            os.replace(tmp, self.FENCE_PATH)
+        except Exception as e:
+            logger.error("Could not write the alert fence: %s", e)
 
     def _circuit_is_open(self) -> bool:
         """Open means: stop calling, the far side is not answering.
@@ -684,12 +923,25 @@ class TelegramBridge:
         self._consecutive_failures = 0
         self._circuit_opened_at = 0.0
 
-    def send(self, message: str, priority: Priority = Priority.P2) -> bool:
+    def send(self, message: str, priority: Priority = Priority.P2,
+             dedup_key: Optional[str] = None) -> bool:
+        """Send one message to the founder.
+
+        `dedup_key` names WHAT the message is about, so a digest whose episode
+        counters have ticked is still recognised as the same alert. Without one,
+        the message text is the key.
+        """
         if not self.enabled:
             logger.info(f"[TELEGRAM would send]: {message}")
             return True
         if priority == Priority.P3:
             return True
+
+        key = dedup_key or "text:" + hashlib.sha256(message.encode()).hexdigest()[:16]
+        if self._already_said(key):
+            logger.info("Already told him about %s inside the cooldown; not repeating", key)
+            return True
+
         if self._circuit_is_open():
             logger.warning("Telegram circuit open, dropping a %s message", priority.name)
             return False
@@ -724,6 +976,7 @@ class TelegramBridge:
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     if resp.status == 200:
                         self._record_success()
+                        self._record_said(key)
                         return True
                     last_error = f"HTTP {resp.status}"
             except urllib.error.HTTPError as e:
@@ -770,7 +1023,12 @@ class TelegramBridge:
         if not needs_human and not incidents:
             lines.append("\n✅ All clear. Nothing needs you.")
 
-        return self.send("\n".join(lines), Priority.P2)
+        # Key on WHICH things need him, not on the rendered text: the stats line
+        # carries episode and spend counters that move every tick, so the text
+        # of an unchanged estate is never twice the same.
+        subject = ",".join(sorted(str(i.get("id", "?")) for i in needs_human))
+        key = "digest:" + hashlib.sha256(subject.encode()).hexdigest()[:16]
+        return self.send("\n".join(lines), Priority.P2, dedup_key=key)
 
     def poll_commands(self) -> List[Dict]:
         if not self.enabled:
@@ -802,20 +1060,146 @@ class TelegramBridge:
 # ───────────────────────────────────────────────────────────────────────────────
 
 class EstateSensors:
+    # What the estate audit actually writes, and what this class used to expect.
+    #
+    # `estate_audit.py:474` emits {"generated_at": <epoch>, "counts": {...},
+    # "rows": [{domain, title, value, severity, proof, detail}]} with severities
+    # from `estate_audit.py:43` -- critical / warn / ok / unknown. This class
+    # asked for `data["findings"]` and P0..P3 and got neither, so every read
+    # returned an empty list. Measured 2026-08-23 20:07: a 24,311-byte file
+    # holding 57 rows and 8 criticals, read once a minute, producing 0 findings
+    # and the log line "All clear -- no digest sent (P3)". The estate had a
+    # billing incident and unrestorable backups that whole time.
+    #
+    # A key that does not exist is the worst kind of sensor fault: nothing
+    # raises, nothing logs, and silence is indistinguishable from health.
+    AUDIT_SEVERITY_TO_PRIORITY = {"critical": "P0", "warn": "P1", "unknown": "P2"}
+    # `ok` rows are the audit saying a check passed. They are not findings and
+    # are dropped rather than mapped, so a clean estate still reports clean.
+    AUDIT_SEVERITY_IGNORED = frozenset({"ok"})
+    # The audit runs on its own schedule. Past this, what it says is history,
+    # and reading history as current state is how a dead checker looks green.
+    AUDIT_STALE_AFTER_HOURS = float(os.getenv("MAESTRO_AUDIT_STALE_H", "6"))
+
     def __init__(self):
         self.audit_path = os.path.expanduser(Config.ESTATE_AUDIT_PATH)
+
+    def _sensor_fault(self, fault_id: str, description: str) -> Dict:
+        """A sensor that cannot see must say so, not report nothing.
+
+        These are P1: the estate may be perfectly healthy, but nobody can
+        currently tell, and that is a fact the founder needs rather than a
+        silence he will read as good news.
+        """
+        return {
+            "id": fault_id,
+            "severity": "P1",
+            "lane": "estate",
+            "description": description,
+            "auto_fix": False,
+            "skill": "estate_audit_repair",
+            "context": {"audit_path": self.audit_path},
+        }
 
     def read_audit(self) -> List[Dict]:
         if not os.path.exists(self.audit_path):
             logger.warning(f"Audit file not found: {self.audit_path}")
-            return []
+            return [self._sensor_fault(
+                "estate-audit-missing",
+                f"The estate audit maestro senses through is not there: {self.audit_path}",
+            )]
         try:
             with open(self.audit_path) as f:
                 data = json.load(f)
-                return data.get("findings", [])
         except Exception as e:
             logger.error(f"Failed to read audit: {e}")
-            return []
+            return [self._sensor_fault(
+                "estate-audit-unreadable",
+                f"The estate audit cannot be read: {e}",
+            )]
+
+        findings: List[Dict] = []
+
+        age_h = (time.time() - os.path.getmtime(self.audit_path)) / 3600
+        generated_at = data.get("generated_at")
+        if isinstance(generated_at, (int, float)):
+            age_h = (time.time() - generated_at) / 3600
+        if age_h > self.AUDIT_STALE_AFTER_HOURS:
+            findings.append(self._sensor_fault(
+                "estate-audit-stale",
+                f"The estate audit last ran {age_h:.1f}h ago; "
+                f"everything below it is that old",
+            ))
+
+        # `rows` is what the audit writes today. `findings` is accepted too, so a
+        # writer that already speaks this class's own shape keeps working.
+        rows = data.get("rows")
+        if rows is None:
+            rows = data.get("findings")
+        if rows is None:
+            logger.error(
+                "The audit at %s has neither 'rows' nor 'findings' (keys: %s)",
+                self.audit_path, sorted(data)[:10],
+            )
+            return findings + [self._sensor_fault(
+                "estate-audit-schema-unknown",
+                f"The estate audit has no rows this reader understands "
+                f"(keys: {', '.join(sorted(data)[:10])})",
+            )]
+
+        unmapped = set()
+        for row in rows:
+            severity = str(row.get("severity", "")).lower()
+            if severity in self.AUDIT_SEVERITY_IGNORED:
+                continue
+            # Already in this class's vocabulary: pass it through untouched.
+            if severity.upper() in ("P0", "P1", "P2", "P3"):
+                findings.append(row)
+                continue
+            priority = self.AUDIT_SEVERITY_TO_PRIORITY.get(severity)
+            if priority is None:
+                # Never drop a row because its severity is a word nobody taught
+                # this map. An unknown severity is treated as a real finding at
+                # P1 and the word is reported, because a silent skip here is the
+                # exact defect this whole function is a fix for.
+                unmapped.add(severity or "(blank)")
+                priority = "P1"
+
+            domain = row.get("domain", "estate")
+            title = row.get("title", "untitled check")
+            value = row.get("value", "")
+            findings.append({
+                "id": "estate-audit-" + hashlib.sha256(
+                    f"{domain}|{title}".encode()
+                ).hexdigest()[:12],
+                "severity": priority,
+                "lane": "estate",
+                "description": f"[{domain}] {title}: {value}",
+                # An audit row describes a state, not a repair. Nothing here has
+                # a verified skill behind it, and _do_act invents an `echo` skill
+                # for anything marked auto-fixable and then records it as
+                # resolved -- a fix that never happened, reported as one.
+                "auto_fix": False,
+                "skill": "estate_audit_followup",
+                "context": {
+                    "domain": domain,
+                    "title": title,
+                    "value": value,
+                    "proof": row.get("proof", ""),
+                    "detail": row.get("detail", ""),
+                },
+            })
+
+        if unmapped:
+            logger.warning(
+                "Audit severities this reader does not know, raised as P1: %s",
+                ", ".join(sorted(unmapped)),
+            )
+        logger.info(
+            "Estate audit: %d row(s) read, %d finding(s) after dropping %s",
+            len(rows), len(findings), "/".join(sorted(self.AUDIT_SEVERITY_IGNORED)),
+        )
+        return findings
 
     def check_bridges(self) -> List[Dict]:
         findings = []
@@ -906,8 +1290,16 @@ class EstateSensors:
                                 "severity": "P0",
                                 "lane": "estate",
                                 "description": f"{name} found in {hist_path}",
-                                "auto_fix": False,
-                                "skill": "credential_rotation",
+                                # Removing a leaked key from a history file is a
+                                # repair, not a rotation, and secret-scrub.py already
+                                # runs on every Stop hook estate wide, so letting
+                                # maestro run it adds no reach it did not have. It
+                                # redacts in place, never changes a line count, and
+                                # refuses the files whose job is to hold secrets.
+                                # Rotating the key at the provider is still a person's
+                                # decision and is not what this does.
+                                "auto_fix": True,
+                                "skill": "credential-leak-surface",
                                 "context": {"file": hist_path, "key_type": name}
                             })
             except Exception as e:
@@ -1111,6 +1503,7 @@ class Maestro:
 
     def _do_sense(self):
         findings = self.sensors.sense()
+        self._close_alarms_for_what_cleared(findings)
         self.daily_findings.extend(findings)
         p0s = [f for f in findings if f.get("severity") == "P0"]
         if p0s:
@@ -1121,6 +1514,33 @@ class Maestro:
             self._transition(State.ORIENT)
         else:
             self._transition(State.REPORT)
+
+    def _close_alarms_for_what_cleared(self, findings: List[Dict]):
+        """A problem that stopped being sensed closes its alarm, once, out loud."""
+        cleared = self.db.close_cleared_alarms({str(f.get("id", "?")) for f in findings})
+        for alarm in cleared:
+            self.db.log_episode(Episode(
+                id=f"EP-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-cleared-"
+                   f"{hashlib.sha256(alarm['finding_id'].encode()).hexdigest()[:6]}",
+                timestamp=datetime.utcnow().isoformat(),
+                lane=alarm.get("lane") or "estate",
+                trigger=alarm.get("description") or alarm["finding_id"],
+                action="alarm_cleared",
+                outcome="self_cleared",
+                evidence={"finding_id": alarm["finding_id"],
+                          "open_since": alarm["first_seen"],
+                          "times_seen": alarm["times_seen"]},
+            ))
+        if cleared:
+            names = "\n".join(
+                f"• {a.get('description') or a['finding_id']}" for a in cleared
+            )
+            subject = ",".join(sorted(a["finding_id"] for a in cleared))
+            self.bridge.send(
+                f"✅ Cleared: {len(cleared)} alarm(s) no longer present\n{names}",
+                Priority.P1,
+                dedup_key="cleared:" + hashlib.sha256(subject.encode()).hexdigest()[:16],
+            )
 
     def _do_orient(self):
         intent = self.current_intent
@@ -1207,15 +1627,35 @@ class Maestro:
             skill = self.db.get_skill(skill_id)
 
             if not skill:
-                skill = Skill(
-                    id=skill_id,
-                    name=f"Auto-generated fix for {finding['id']}",
-                    lane=finding.get("lane", "estate"),
-                    trigger_pattern=finding["description"],
-                    procedure=f"shell: echo 'Fix for {finding['id']}'",
-                    created_from_shape=finding.get("shape_extracted")
+                # The sensor names its fix with a string written next to the check
+                # ("disk_cleanup"), while fixes are registered against the shape
+                # they repair. The two drifted, so check_disk asked for a skill id
+                # that has never existed. The graph is the source of truth about
+                # what handles an incident, so ask it before giving up.
+                skill = self.extractor.find_prevention(
+                    finding["description"], finding.get("lane", "estate")
                 )
-                self.db.upsert_skill(skill)
+
+            if not skill:
+                # There is no skill for this. Until today the code wrote one whose
+                # whole procedure was `echo 'Fix for X'`, saved it to the skills
+                # table as though it were real, and then read echo's exit 0 as a
+                # successful repair: the incident was reported resolved and the
+                # graph gained a fake skill that would be trusted next time. An
+                # incident nobody can fix goes to a person, and says why.
+                logger.warning(
+                    f"No skill for {finding['id']} ({skill_id}); escalating instead of inventing one"
+                )
+                finding["route"] = "escalate"
+                finding["no_skill"] = skill_id
+                self.daily_needs_human.append(finding)
+                intent.execution["results"].append({
+                    "finding_id": finding["id"],
+                    "skill_id": skill_id,
+                    "success": False,
+                    "evidence": {"reason": "no skill exists for this shape"}
+                })
+                continue
 
             success, evidence = self.executor.execute(skill, finding.get("context", {}))
             intent.execution["results"].append({
@@ -1267,8 +1707,23 @@ class Maestro:
     def _do_report(self):
         stats = self.db.get_stats()
 
-        if self.daily_needs_human:
-            self.bridge.send_digest(stats, self.daily_resolved, self.daily_needs_human)
+        # Same ledger as _do_crisis: a needs_human finding already alarmed and
+        # still standing is counted, not re-escalated and not re-episoded.
+        needs_human_news = []
+        suppressed = 0
+        for finding in self.daily_needs_human:
+            disposition = self.db.alarm_disposition(
+                str(finding.get("id", "?")),
+                finding.get("description", ""),
+                finding.get("lane", "estate"),
+            )
+            if disposition == "suppressed":
+                suppressed += 1
+            else:
+                needs_human_news.append(finding)
+
+        if needs_human_news:
+            self.bridge.send_digest(stats, self.daily_resolved, needs_human_news)
         elif self.daily_resolved:
             self.bridge.send(f"✅ Auto-resolved {len(self.daily_resolved)} issues. All clear.", Priority.P3)
         else:
@@ -1286,7 +1741,7 @@ class Maestro:
                 shape_id=finding.get("shape_extracted")
             ))
 
-        for finding in self.daily_needs_human:
+        for finding in needs_human_news:
             self.db.log_episode(Episode(
                 id=f"EP-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{finding['id']}",
                 timestamp=datetime.utcnow().isoformat(),
@@ -1297,6 +1752,11 @@ class Maestro:
                 evidence=finding.get("context", {}),
                 shape_id=finding.get("shape_extracted")
             ))
+        if suppressed:
+            logger.info(
+                "%d standing needs_human alarm(s) already open; ledger updated",
+                suppressed,
+            )
 
         self.daily_findings = []
         self.daily_resolved = []
@@ -1306,24 +1766,54 @@ class Maestro:
 
     def _do_crisis(self):
         p0_findings = [f for f in self.daily_findings if f.get("severity") == "P0"]
-        self.bridge.send(
-            f"🚨 *CRISIS MODE*\n\n"
-            f"{len(p0_findings)} P0 finding(s):\n" +
-            "\n".join(f"• {f['description']}" for f in p0_findings) +
-            "\n\nAll non-essential lanes frozen. Manual intervention required.",
-            Priority.P0
-        )
 
+        # The alarm ledger, not the message fence, decides who gets escalated.
+        # The fence only spaces repeats of one message; without the ledger a
+        # standing P0 wrote a fresh needs_human episode every three-minute pass
+        # — 46 copies of one Stripe finding in 29 hours, and nothing ever said
+        # it had cleared.
+        to_alert = []
+        suppressed = 0
         for finding in p0_findings:
-            self.db.log_episode(Episode(
-                id=f"CRISIS-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{finding['id']}",
-                timestamp=datetime.utcnow().isoformat(),
-                lane=finding.get("lane", "estate"),
-                trigger=finding["description"],
-                action="crisis_escalation",
-                outcome="needs_human",
-                evidence=finding.get("context", {})
-            ))
+            disposition = self.db.alarm_disposition(
+                str(finding.get("id", "?")),
+                finding.get("description", ""),
+                finding.get("lane", "estate"),
+            )
+            if disposition == "suppressed":
+                suppressed += 1
+            else:
+                to_alert.append(finding)
+
+        if to_alert:
+            subject = ",".join(sorted(str(f.get("id", "?")) for f in to_alert))
+            self.bridge.send(
+                f"🚨 *CRISIS MODE*\n\n"
+                f"{len(to_alert)} P0 finding(s):\n" +
+                "\n".join(f"• {f['description']}" for f in to_alert) +
+                "\n\nAll non-essential lanes frozen. Manual intervention required.",
+                Priority.P0,
+                dedup_key="crisis:" + hashlib.sha256(subject.encode()).hexdigest()[:16],
+            )
+            for finding in to_alert:
+                self.db.log_episode(Episode(
+                    # The timestamp is second-resolution, so the same finding
+                    # escalating twice inside a second needs the random tail to
+                    # avoid a UNIQUE collision that would crash the loop.
+                    id=f"CRISIS-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-"
+                       f"{os.urandom(3).hex()}-{finding['id']}",
+                    timestamp=datetime.utcnow().isoformat(),
+                    lane=finding.get("lane", "estate"),
+                    trigger=finding["description"],
+                    action="crisis_escalation",
+                    outcome="needs_human",
+                    evidence=finding.get("context", {})
+                ))
+        if suppressed:
+            logger.info(
+                "%d standing P0 alarm(s) already open; ledger updated, founder not re-paged",
+                suppressed,
+            )
 
         self.crisis_mode = False
         self.daily_findings = []
