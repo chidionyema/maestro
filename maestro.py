@@ -313,6 +313,16 @@ class ExperienceGraph:
                     date TEXT PRIMARY KEY,
                     amount_usd REAL DEFAULT 0.0
                 );
+
+                CREATE TABLE IF NOT EXISTS open_alarms (
+                    finding_id TEXT PRIMARY KEY,
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL,
+                    last_alerted TEXT NOT NULL,
+                    times_seen INTEGER DEFAULT 1,
+                    description TEXT,
+                    lane TEXT
+                );
             """)
 
     def log_episode(self, episode: Episode) -> None:
@@ -327,6 +337,73 @@ class ExperienceGraph:
                 episode.action, episode.outcome, json.dumps(episode.evidence),
                 episode.duration_ms, episode.cost_usd, episode.shape_id
             ))
+
+    # A standing problem alerts again after this long, so suppression cannot
+    # become silence. 24h, because the founder reads a daily rhythm, not a tick.
+    ALARM_REALERT_SECONDS = 24 * 3600
+
+    def alarm_disposition(self, finding_id: str, description: str = "",
+                          lane: str = "estate") -> str:
+        """One open alarm per live problem, so a problem pages once, not once per tick.
+
+        Returns "new" on first sighting, "realert" when the interval has lapsed
+        with the problem still standing, "suppressed" otherwise. Every call
+        updates last_seen and the sighting count, so the eventual cleared episode
+        can say how long it stood and how many times it was seen.
+        """
+        now = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT last_alerted FROM open_alarms WHERE finding_id = ?",
+                (finding_id,),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO open_alarms "
+                    "(finding_id, first_seen, last_seen, last_alerted, times_seen, description, lane) "
+                    "VALUES (?, ?, ?, ?, 1, ?, ?)",
+                    (finding_id, now, now, now, description, lane),
+                )
+                return "new"
+            lapsed = (datetime.utcnow() - datetime.fromisoformat(row[0])).total_seconds()
+            if lapsed >= self.ALARM_REALERT_SECONDS:
+                conn.execute(
+                    "UPDATE open_alarms SET last_seen = ?, last_alerted = ?, "
+                    "times_seen = times_seen + 1 WHERE finding_id = ?",
+                    (now, now, finding_id),
+                )
+                return "realert"
+            conn.execute(
+                "UPDATE open_alarms SET last_seen = ?, times_seen = times_seen + 1 "
+                "WHERE finding_id = ?",
+                (now, finding_id),
+            )
+            return "suppressed"
+
+    def close_cleared_alarms(self, active_ids) -> List[Dict[str, Any]]:
+        """Close every open alarm whose problem this sense pass did not find.
+
+        Returns the closed rows so the caller can say the problem ended. An
+        alarm that opens loudly and closes silently teaches that silence means
+        nothing, which is how channels get muted.
+        """
+        active = set(active_ids)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT finding_id, first_seen, last_seen, times_seen, description, lane "
+                "FROM open_alarms"
+            ).fetchall()
+            closed = [
+                {"finding_id": r[0], "first_seen": r[1], "last_seen": r[2],
+                 "times_seen": r[3], "description": r[4], "lane": r[5]}
+                for r in rows if r[0] not in active
+            ]
+            for alarm in closed:
+                conn.execute(
+                    "DELETE FROM open_alarms WHERE finding_id = ?",
+                    (alarm["finding_id"],),
+                )
+        return closed
 
     def get_shapes(self, pattern_name: Optional[str] = None) -> List[Shape]:
         with self._connect() as conn:
@@ -1426,6 +1503,7 @@ class Maestro:
 
     def _do_sense(self):
         findings = self.sensors.sense()
+        self._close_alarms_for_what_cleared(findings)
         self.daily_findings.extend(findings)
         p0s = [f for f in findings if f.get("severity") == "P0"]
         if p0s:
@@ -1436,6 +1514,33 @@ class Maestro:
             self._transition(State.ORIENT)
         else:
             self._transition(State.REPORT)
+
+    def _close_alarms_for_what_cleared(self, findings: List[Dict]):
+        """A problem that stopped being sensed closes its alarm, once, out loud."""
+        cleared = self.db.close_cleared_alarms({str(f.get("id", "?")) for f in findings})
+        for alarm in cleared:
+            self.db.log_episode(Episode(
+                id=f"EP-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-cleared-"
+                   f"{hashlib.sha256(alarm['finding_id'].encode()).hexdigest()[:6]}",
+                timestamp=datetime.utcnow().isoformat(),
+                lane=alarm.get("lane") or "estate",
+                trigger=alarm.get("description") or alarm["finding_id"],
+                action="alarm_cleared",
+                outcome="self_cleared",
+                evidence={"finding_id": alarm["finding_id"],
+                          "open_since": alarm["first_seen"],
+                          "times_seen": alarm["times_seen"]},
+            ))
+        if cleared:
+            names = "\n".join(
+                f"• {a.get('description') or a['finding_id']}" for a in cleared
+            )
+            subject = ",".join(sorted(a["finding_id"] for a in cleared))
+            self.bridge.send(
+                f"✅ Cleared: {len(cleared)} alarm(s) no longer present\n{names}",
+                Priority.P1,
+                dedup_key="cleared:" + hashlib.sha256(subject.encode()).hexdigest()[:16],
+            )
 
     def _do_orient(self):
         intent = self.current_intent
@@ -1602,8 +1707,23 @@ class Maestro:
     def _do_report(self):
         stats = self.db.get_stats()
 
-        if self.daily_needs_human:
-            self.bridge.send_digest(stats, self.daily_resolved, self.daily_needs_human)
+        # Same ledger as _do_crisis: a needs_human finding already alarmed and
+        # still standing is counted, not re-escalated and not re-episoded.
+        needs_human_news = []
+        suppressed = 0
+        for finding in self.daily_needs_human:
+            disposition = self.db.alarm_disposition(
+                str(finding.get("id", "?")),
+                finding.get("description", ""),
+                finding.get("lane", "estate"),
+            )
+            if disposition == "suppressed":
+                suppressed += 1
+            else:
+                needs_human_news.append(finding)
+
+        if needs_human_news:
+            self.bridge.send_digest(stats, self.daily_resolved, needs_human_news)
         elif self.daily_resolved:
             self.bridge.send(f"✅ Auto-resolved {len(self.daily_resolved)} issues. All clear.", Priority.P3)
         else:
@@ -1621,7 +1741,7 @@ class Maestro:
                 shape_id=finding.get("shape_extracted")
             ))
 
-        for finding in self.daily_needs_human:
+        for finding in needs_human_news:
             self.db.log_episode(Episode(
                 id=f"EP-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{finding['id']}",
                 timestamp=datetime.utcnow().isoformat(),
@@ -1632,6 +1752,11 @@ class Maestro:
                 evidence=finding.get("context", {}),
                 shape_id=finding.get("shape_extracted")
             ))
+        if suppressed:
+            logger.info(
+                "%d standing needs_human alarm(s) already open; ledger updated",
+                suppressed,
+            )
 
         self.daily_findings = []
         self.daily_resolved = []
@@ -1641,26 +1766,54 @@ class Maestro:
 
     def _do_crisis(self):
         p0_findings = [f for f in self.daily_findings if f.get("severity") == "P0"]
-        subject = ",".join(sorted(str(f.get("id", "?")) for f in p0_findings))
-        self.bridge.send(
-            f"🚨 *CRISIS MODE*\n\n"
-            f"{len(p0_findings)} P0 finding(s):\n" +
-            "\n".join(f"• {f['description']}" for f in p0_findings) +
-            "\n\nAll non-essential lanes frozen. Manual intervention required.",
-            Priority.P0,
-            dedup_key="crisis:" + hashlib.sha256(subject.encode()).hexdigest()[:16],
-        )
 
+        # The alarm ledger, not the message fence, decides who gets escalated.
+        # The fence only spaces repeats of one message; without the ledger a
+        # standing P0 wrote a fresh needs_human episode every three-minute pass
+        # — 46 copies of one Stripe finding in 29 hours, and nothing ever said
+        # it had cleared.
+        to_alert = []
+        suppressed = 0
         for finding in p0_findings:
-            self.db.log_episode(Episode(
-                id=f"CRISIS-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{finding['id']}",
-                timestamp=datetime.utcnow().isoformat(),
-                lane=finding.get("lane", "estate"),
-                trigger=finding["description"],
-                action="crisis_escalation",
-                outcome="needs_human",
-                evidence=finding.get("context", {})
-            ))
+            disposition = self.db.alarm_disposition(
+                str(finding.get("id", "?")),
+                finding.get("description", ""),
+                finding.get("lane", "estate"),
+            )
+            if disposition == "suppressed":
+                suppressed += 1
+            else:
+                to_alert.append(finding)
+
+        if to_alert:
+            subject = ",".join(sorted(str(f.get("id", "?")) for f in to_alert))
+            self.bridge.send(
+                f"🚨 *CRISIS MODE*\n\n"
+                f"{len(to_alert)} P0 finding(s):\n" +
+                "\n".join(f"• {f['description']}" for f in to_alert) +
+                "\n\nAll non-essential lanes frozen. Manual intervention required.",
+                Priority.P0,
+                dedup_key="crisis:" + hashlib.sha256(subject.encode()).hexdigest()[:16],
+            )
+            for finding in to_alert:
+                self.db.log_episode(Episode(
+                    # The timestamp is second-resolution, so the same finding
+                    # escalating twice inside a second needs the random tail to
+                    # avoid a UNIQUE collision that would crash the loop.
+                    id=f"CRISIS-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-"
+                       f"{os.urandom(3).hex()}-{finding['id']}",
+                    timestamp=datetime.utcnow().isoformat(),
+                    lane=finding.get("lane", "estate"),
+                    trigger=finding["description"],
+                    action="crisis_escalation",
+                    outcome="needs_human",
+                    evidence=finding.get("context", {})
+                ))
+        if suppressed:
+            logger.info(
+                "%d standing P0 alarm(s) already open; ledger updated, founder not re-paged",
+                suppressed,
+            )
 
         self.crisis_mode = False
         self.daily_findings = []
