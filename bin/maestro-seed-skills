@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""Put maestro's skills in git, and back into the database on demand.
+
+Maestro has always had a working skill engine: a loader, an executor with a
+path allowlist and a dangerous-pattern refusal, and success-rate accounting.
+It had no skills. So every finding marked auto_fix fell through to the
+fallback in _do_act, which invents a skill whose procedure is `echo`, runs it,
+watches _do_verify catch that nothing changed, and files needs_human. Measured
+on 2026-08-23: 121 episodes, 0 skills, and the same bridge reported down twice
+seven minutes apart with nobody able to restart it.
+
+A skill lives in ~/.maestro/experience_graph.db, which is generated state and
+correctly outside version control. That left the skill itself unreviewable and
+one accident from gone, which LAW 24 does not allow for anything load-bearing.
+This file is the tracked copy. Run it to put the skills back.
+
+    bin/maestro-seed-skills           upsert every skill below, print the table
+    bin/maestro-seed-skills --check   report drift, change nothing, exit 1 on drift
+
+It only ever writes the procedure, name and trigger. Success counters belong to
+the running system and are never reset by a seed.
+"""
+from __future__ import annotations
+
+import os
+import pathlib
+import re
+import sqlite3
+import sys
+
+DB = pathlib.Path(os.getenv("MAESTRO_DB", str(pathlib.Path.home() / ".maestro/experience_graph.db")))
+
+# Mirrors SkillExecutor.ALLOWED_PATHS / DANGEROUS_PATTERNS in maestro.py. A seed
+# that stores a procedure the executor will refuse is a skill that silently never
+# runs, so the same two guards are applied here, before anything is written.
+ALLOWED_PATHS = [
+    os.path.expanduser("~/.estate"),
+    os.path.expanduser("~/.maestro"),
+    os.path.expanduser("~/prospector"),
+    "/tmp",
+]
+SUSPICIOUS = ["/etc/", "/usr/", "/bin/", "/sbin/", "/var/", "/home/"]
+DANGEROUS = [
+    r"rm\s+-rf\s+/",
+    r"rm\s+-rf\s+~",
+    r":\s*\{\s*:\s*\}\s*;\s*while",
+    r"mkfs\.",
+    r"dd\s+if=.*of=/dev/",
+]
+
+# The executor does not interpolate a finding's context into a procedure, so a
+# skill cannot be told which bridge died. It checks all three and repairs what
+# is down, then re-checks and exits non-zero if anything is still down, so a
+# failed repair is recorded as a failure rather than as a green echo.
+RESTART_BRIDGE = (
+    "shell: "
+    "for p in 8765 8767 11434; do "
+    "lsof -nP -iTCP:$p -sTCP:LISTEN >/dev/null 2>&1 && continue; "
+    "case $p in "
+    "8765) launchctl kickstart -k gui/$(id -u)/ai.estate.kimi-bridge ;; "
+    "8767) launchctl kickstart -k gui/$(id -u)/ai.estate.deepseek-bridge ;; "
+    "11434) open -gja Ollama ;; "
+    "esac; "
+    "done; "
+    "sleep 8; "
+    'DOWN=""; '
+    "for p in 8765 8767 11434; do "
+    'lsof -nP -iTCP:$p -sTCP:LISTEN >/dev/null 2>&1 || DOWN="$DOWN $p"; '
+    "done; "
+    '[ -z "$DOWN" ] && { echo "all bridges listening"; exit 0; }; '
+    'echo "still down:$DOWN"; exit 1'
+)
+
+SKILLS = [
+    {
+        "id": "restart_bridge",
+        "name": "restart a local bridge that stopped listening",
+        "lane": "estate",
+        "trigger_pattern": "not responding on port",
+        "procedure": RESTART_BRIDGE,
+    },
+]
+
+
+def refuses(procedure: str) -> str | None:
+    """The reason the executor would refuse this procedure, or None."""
+    for s in SUSPICIOUS:
+        if s in procedure and not any(a in procedure for a in ALLOWED_PATHS):
+            return f"path violation: {s}"
+    for pat in DANGEROUS:
+        if re.search(pat, procedure):
+            return f"dangerous pattern: {pat}"
+    return None
+
+
+def main() -> int:
+    check_only = "--check" in sys.argv
+
+    for s in SKILLS:
+        why = refuses(s["procedure"])
+        if why:
+            print(f"REFUSED {s['id']}: the executor would block this ({why})", file=sys.stderr)
+            return 1
+
+    if not DB.exists():
+        print(f"no database at {DB}; start maestro once, then seed", file=sys.stderr)
+        return 1
+
+    conn = sqlite3.connect(str(DB))
+    drift = 0
+    for s in SKILLS:
+        row = conn.execute(
+            "SELECT procedure FROM skills WHERE id = ?", (s["id"],)
+        ).fetchone()
+        if row and row[0] == s["procedure"]:
+            state = "in sync"
+        elif row:
+            state = "DRIFTED from the tracked copy"
+            drift += 1
+        else:
+            state = "MISSING from the database"
+            drift += 1
+        print(f"  {s['id']:<16} {state}")
+
+        if not check_only:
+            conn.execute(
+                """INSERT INTO skills
+                   (id, name, lane, trigger_pattern, procedure,
+                    success_rate, total_uses, created_from_shape, last_used, avg_duration_ms)
+                   VALUES (?,?,?,?,?,0.0,0,NULL,'',0)
+                   ON CONFLICT(id) DO UPDATE SET
+                     name=excluded.name,
+                     lane=excluded.lane,
+                     trigger_pattern=excluded.trigger_pattern,
+                     procedure=excluded.procedure""",
+                (s["id"], s["name"], s["lane"], s["trigger_pattern"], s["procedure"]),
+            )
+    if not check_only:
+        conn.commit()
+
+    print()
+    for r in conn.execute(
+        "SELECT id, lane, total_uses, success_rate, last_used FROM skills ORDER BY id"
+    ):
+        print("  %-16s lane=%-8s uses=%-4d success_rate=%.2f last_used=%s" % r)
+    print(f"\n  {conn.execute('SELECT count(*) FROM skills').fetchone()[0]} skill(s) in {DB}")
+
+    if check_only:
+        return 1 if drift else 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
