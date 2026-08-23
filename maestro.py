@@ -35,6 +35,39 @@ from pathlib import Path
 # CONFIGURATION
 # ───────────────────────────────────────────────────────────────────────────────
 
+def _borrow_from_architect(key: str) -> str:
+    """Read one value out of The Architect's .env so maestro can reach the founder.
+
+    maestro's launchd plist carries no Telegram credentials, so until 2026-08-23
+    TelegramBridge fell through to its `[TELEGRAM would send]` branch: every
+    escalation it ever raised would have gone to a log file instead of his phone,
+    and a healthy maestro and a mute one produced identical silence.
+
+    Minting a second bot for maestro would cost the founder a trip to BotFather,
+    and a second credential to rotate. The Architect already holds a working bot,
+    and maestro only ever calls sendMessage — never getUpdates — so borrowing the
+    token adds no second poller and cannot make the gateway go deaf.
+
+    The value is read at import from a 600-mode file and never logged or written
+    anywhere else. Returns '' when the file is unreadable, which leaves the
+    existing rehearsal behaviour exactly as it was.
+    """
+    env_path = Path(
+        os.getenv("ARCHITECT_HOME", "~/dev/code/hermes-v2")
+    ).expanduser() / ".env"
+    try:
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, _, value = line.partition("=")
+            if name.strip() == key:
+                return value.strip().strip("'\"")
+    except OSError:
+        return ""
+    return ""
+
+
 class Config:
     """Centralized, environment-overridable configuration."""
     DB_PATH = os.getenv("MAESTRO_DB", "~/.maestro/experience_graph.db")
@@ -50,8 +83,12 @@ class Config:
         "meta": {"auto_fix": False, "escalate_after_attempts": 0, "budget_usd": 5.0},
     }
 
-    TELEGRAM_TOKEN = os.getenv("MAESTRO_TELEGRAM_TOKEN", "")
-    TELEGRAM_CHAT_ID = os.getenv("MAESTRO_TELEGRAM_CHAT_ID", "")
+    TELEGRAM_TOKEN = os.getenv("MAESTRO_TELEGRAM_TOKEN", "") or _borrow_from_architect(
+        "TELEGRAM_BOT_TOKEN"
+    )
+    TELEGRAM_CHAT_ID = os.getenv(
+        "MAESTRO_TELEGRAM_CHAT_ID", ""
+    ) or _borrow_from_architect("TELEGRAM_HOME_CHANNEL")
     GITHUB_TOKEN = os.getenv("MAESTRO_GITHUB_TOKEN", "")
     GITHUB_REPO = os.getenv("MAESTRO_GITHUB_REPO", "")
     DEFAULT_LOCAL_MODEL = os.getenv("MAESTRO_LOCAL_MODEL", "qwen2.5:7b")
