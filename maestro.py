@@ -170,13 +170,31 @@ class ExperienceGraph:
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         self._init_schema()
 
+    def _connect(self) -> sqlite3.Connection:
+        """The one place a connection to the experience graph is opened.
+
+        WAL, because the tick loop reads while a write is in flight and the default
+        rollback journal makes those two block each other. WAL is a property of the
+        database file and survives, so this sets it once and it stays set; the pragma
+        is repeated here anyway because a restored copy arrives in DELETE mode.
+
+        busy_timeout is NOT persistent and is the half that actually bites: it is
+        per-connection, defaults to 0, and a zero timeout turns any overlap into an
+        immediate `database is locked` instead of a short wait.
+        """
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
     def kv_get(self, key: str, default=None):
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             row = conn.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
         return row[0] if row else default
 
     def kv_set(self, key: str, value: str):
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute(
                 "INSERT INTO kv (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -184,7 +202,7 @@ class ExperienceGraph:
             )
 
     def _init_schema(self):
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS kv (
                     key TEXT PRIMARY KEY,
@@ -260,7 +278,7 @@ class ExperienceGraph:
             """)
 
     def log_episode(self, episode: Episode) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute("""
                 INSERT INTO episodes
                 (id, timestamp, lane, trigger, action, outcome, evidence,
@@ -273,7 +291,7 @@ class ExperienceGraph:
             ))
 
     def get_shapes(self, pattern_name: Optional[str] = None) -> List[Shape]:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             if pattern_name:
                 rows = conn.execute(
                     "SELECT * FROM shapes WHERE pattern_name = ?", (pattern_name,)
@@ -283,14 +301,14 @@ class ExperienceGraph:
             return [self._row_to_shape(r) for r in rows]
 
     def get_shape_by_context(self, context: str) -> List[Shape]:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM shapes WHERE contexts_observed LIKE ?", (f"%{context}%",)
             ).fetchall()
             return [self._row_to_shape(r) for r in rows]
 
     def upsert_shape(self, shape: Shape) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute("""
                 INSERT INTO shapes
                 (id, pattern_name, morphology, contexts_observed, invariant_violated,
@@ -311,19 +329,19 @@ class ExperienceGraph:
             ))
 
     def get_skill(self, skill_id: str) -> Optional[Skill]:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             row = conn.execute("SELECT * FROM skills WHERE id = ?", (skill_id,)).fetchone()
             if not row:
                 return None
             return self._row_to_skill(row)
 
     def get_skills_for_lane(self, lane: str) -> List[Skill]:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             rows = conn.execute("SELECT * FROM skills WHERE lane = ?", (lane,)).fetchall()
             return [self._row_to_skill(r) for r in rows]
 
     def upsert_skill(self, skill: Skill) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute("""
                 INSERT INTO skills
                 (id, name, lane, trigger_pattern, procedure, success_rate,
@@ -341,7 +359,7 @@ class ExperienceGraph:
             ))
 
     def get_daily_spend(self, date: str) -> float:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             row = conn.execute(
                 "SELECT amount_usd FROM daily_spend WHERE date = ?", (date,)
             ).fetchone()
@@ -349,7 +367,7 @@ class ExperienceGraph:
 
     def add_spend(self, amount_usd: float) -> None:
         today = datetime.utcnow().strftime("%Y-%m-%d")
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute("""
                 INSERT INTO daily_spend (date, amount_usd)
                 VALUES (?, ?)
@@ -358,7 +376,7 @@ class ExperienceGraph:
             """, (today, amount_usd))
 
     def get_stats(self) -> Dict[str, Any]:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             total_episodes = conn.execute("SELECT COUNT(*) FROM episodes").fetchone()[0]
             total_shapes = conn.execute("SELECT COUNT(*) FROM shapes").fetchone()[0]
             total_skills = conn.execute("SELECT COUNT(*) FROM skills").fetchone()[0]
@@ -618,11 +636,53 @@ class ShapeExtractor:
 # ───────────────────────────────────────────────────────────────────────────────
 
 class TelegramBridge:
+    # Three tries per message: a blip costs a second and is invisible.
+    SEND_TRIES = 3
+    # One message that exhausted all three tries opens the circuit. It has already spent
+    # three attempts proving the far side is not answering; spending another six to reach
+    # a threshold of three MESSAGES would burn most of a tick learning the same fact.
+    BREAKER_THRESHOLD = 1
+    # How long the circuit stays open before one request is allowed through to test the
+    # far side. Telegram being down is not a reason to spend the tick budget on retries,
+    # and it is not a reason to stop trying forever either.
+    BREAKER_COOLDOWN_SECONDS = 300
+
     def __init__(self, token: str, chat_id: str, graph: ExperienceGraph):
         self.token = token
         self.chat_id = chat_id
         self.graph = graph
         self.enabled = bool(token and chat_id)
+        self._consecutive_failures = 0
+        self._circuit_opened_at = 0.0
+
+    def _circuit_is_open(self) -> bool:
+        """Open means: stop calling, the far side is not answering.
+
+        It closes on a clock, not on hope. After the cooldown one request is let
+        through; if it works the counter resets, if it does not the circuit opens
+        again from the current time.
+        """
+        if self._consecutive_failures < self.BREAKER_THRESHOLD:
+            return False
+        if time.time() - self._circuit_opened_at >= self.BREAKER_COOLDOWN_SECONDS:
+            return False
+        return True
+
+    def _record_failure(self) -> None:
+        self._consecutive_failures += 1
+        if self._consecutive_failures == self.BREAKER_THRESHOLD:
+            self._circuit_opened_at = time.time()
+            logger.error(
+                "Telegram circuit open after %d message(s) that exhausted %d tries; "
+                "no further sends for %ds",
+                self.BREAKER_THRESHOLD, self.SEND_TRIES, self.BREAKER_COOLDOWN_SECONDS,
+            )
+
+    def _record_success(self) -> None:
+        if self._consecutive_failures:
+            logger.info("Telegram recovered after %d failure(s)", self._consecutive_failures)
+        self._consecutive_failures = 0
+        self._circuit_opened_at = 0.0
 
     def send(self, message: str, priority: Priority = Priority.P2) -> bool:
         if not self.enabled:
@@ -630,22 +690,37 @@ class TelegramBridge:
             return True
         if priority == Priority.P3:
             return True
-
-        try:
-            import urllib.request
-            import urllib.parse
-            url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-            data = urllib.parse.urlencode({
-                "chat_id": self.chat_id,
-                "text": message,
-                "parse_mode": "Markdown"
-            }).encode()
-            req = urllib.request.Request(url, data=data, method="POST")
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                return resp.status == 200
-        except Exception as e:
-            logger.error(f"Telegram send failed: {e}")
+        if self._circuit_is_open():
+            logger.warning("Telegram circuit open, dropping a %s message", priority.name)
             return False
+
+        import urllib.request
+        import urllib.parse
+        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        data = urllib.parse.urlencode({
+            "chat_id": self.chat_id,
+            "text": message,
+            "parse_mode": "Markdown"
+        }).encode()
+
+        last_error = None
+        for attempt in range(self.SEND_TRIES):
+            try:
+                req = urllib.request.Request(url, data=data, method="POST")
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    if resp.status == 200:
+                        self._record_success()
+                        return True
+                    last_error = f"HTTP {resp.status}"
+            except Exception as e:
+                last_error = str(e)
+            if attempt < self.SEND_TRIES - 1:
+                time.sleep(2 ** attempt)
+
+        logger.error("Telegram send failed after %d tries: %s",
+                     self.SEND_TRIES, last_error)
+        self._record_failure()
+        return False
 
     def send_digest(self, stats: Dict, incidents: List[Dict], needs_human: List[Dict]) -> bool:
         lines = [
@@ -941,7 +1016,7 @@ class Maestro:
     def _seed_invariants(self):
         laws = ["LAW_CONTEXT", "LAW_DEGREE", "LAW_BASELINE",
                 "LAW_TRADEOFF", "LAW_RIPPLE", "LAW_MECHANISM", "LAW_SOURCE"]
-        with sqlite3.connect(self.db.db_path) as conn:
+        with self.db._connect() as conn:
             for law in laws:
                 conn.execute("""
                     INSERT OR IGNORE INTO invariants (id, law_name, last_enforced)
@@ -1230,7 +1305,7 @@ class Maestro:
 
     def _do_meta_review(self):
         stats = self.db.get_stats()
-        with sqlite3.connect(self.db.db_path) as conn:
+        with self.db._connect() as conn:
             yesterday = (datetime.utcnow() - timedelta(hours=24)).isoformat()
             rows = conn.execute(
                 "SELECT * FROM episodes WHERE timestamp > ?", (yesterday,)
