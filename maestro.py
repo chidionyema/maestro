@@ -1526,6 +1526,10 @@ class Maestro:
         self.state = State.IDLE
         self.current_intent: Optional[Intent] = None
         self.crisis_mode = False
+        # Disposition of each P0 seen this pass, decided once in SENSE and read
+        # in CRISIS. Empty on a fresh process, so CRISIS still works if it is
+        # ever entered without a SENSE ahead of it.
+        self.p0_dispositions: Dict[str, str] = {}
         # Was: utcnow() - 25h. That made every fresh process go IDLE -> META_REVIEW
         # and stop there, so `--once` could never reach SENSE and the dry test only
         # ever exercised one branch. The timestamp is durable now: a restart resumes
@@ -1613,10 +1617,40 @@ class Maestro:
         self._close_alarms_for_what_cleared(findings)
         self.daily_findings.extend(findings)
         p0s = [f for f in findings if f.get("severity") == "P0"]
-        if p0s:
+
+        # One disposition call per P0 per pass, made here and carried to CRISIS.
+        # The call mutates (times_seen, last_seen), so asking twice in a cycle
+        # would double-count how often the founder saw a problem.
+        self.p0_dispositions = {
+            str(f.get("id", "?")): self.db.alarm_disposition(
+                str(f.get("id", "?")),
+                f.get("description", ""),
+                f.get("lane", "estate"),
+            )
+            for f in p0s
+        }
+
+        # Only news freezes the estate. A P0 whose alarm is already open has
+        # already reached him, so freezing on it again buys nothing and costs
+        # every other lane. Measured on the live loop 2026-08-24: 5 standing
+        # audit P0s, two of which maestro cannot clear at all (this machine's
+        # load average, another session's detached HEAD), held it in
+        # SENSE -> CRISIS -> IDLE forever, so ORIENT, DECIDE, ACT and VERIFY
+        # were never once reached and the other 36 findings got no work. A
+        # permanent freeze is not a safety property, it is an outage with a
+        # siren on it.
+        fresh = [f for f in p0s
+                 if self.p0_dispositions.get(str(f.get("id", "?"))) != "suppressed"]
+        if fresh:
             self.crisis_mode = True
             self._transition(State.CRISIS)
             return
+        if p0s:
+            logger.info(
+                "%d standing P0(s) already open and already escalated; "
+                "working the other %d finding(s) instead of freezing",
+                len(p0s), len(findings) - len(p0s),
+            )
         if findings:
             self._transition(State.ORIENT)
         else:
@@ -2034,11 +2068,16 @@ class Maestro:
         to_alert = []
         suppressed = 0
         for finding in p0_findings:
-            disposition = self.db.alarm_disposition(
-                str(finding.get("id", "?")),
-                finding.get("description", ""),
-                finding.get("lane", "estate"),
-            )
+            fid = str(finding.get("id", "?"))
+            # SENSE already asked, in this same pass, and asking again would
+            # bump the sighting count a second time.
+            disposition = self.p0_dispositions.get(fid)
+            if disposition is None:
+                disposition = self.db.alarm_disposition(
+                    fid,
+                    finding.get("description", ""),
+                    finding.get("lane", "estate"),
+                )
             if disposition == "suppressed":
                 suppressed += 1
             else:
