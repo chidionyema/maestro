@@ -1758,8 +1758,25 @@ class Maestro:
                 continue
 
             if finding.get("severity") == "P0":
-                finding["route"] = "escalate"
-                intent.decision["escalate"].append(finding)
+                # A P0 pages first and learns second. The paging half is real:
+                # a fresh P0 reaches CRISIS and the founder before this method
+                # ever sees it, and a standing one is held by the alarm ledger.
+                # The learning half died here — this branch escalated
+                # unconditionally, so the two worst repeat offenders (a Stripe
+                # key paged 85 times, a full disk paged 33) each arrived
+                # carrying auto_fix=True and a tested skill, and were handed
+                # back to a person every single time. Measured 2026-08-24:
+                # 0 auto_fix decisions across all 232 live intents. The page
+                # already happened; attempting the named repair costs him
+                # nothing, and a failed or unverified fix still lands in
+                # needs_human via ACT and VERIFY.
+                if finding.get("auto_fix") and lane_config["auto_fix"]:
+                    finding["route"] = "auto_fix"
+                    finding.setdefault("context", {})["p0_paged_first"] = True
+                    intent.decision["auto_fix"].append(finding)
+                else:
+                    finding["route"] = "escalate"
+                    intent.decision["escalate"].append(finding)
             elif finding.get("auto_fix") and lane_config["auto_fix"]:
                 finding["route"] = "auto_fix"
                 intent.decision["auto_fix"].append(finding)
